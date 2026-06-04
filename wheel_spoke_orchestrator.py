@@ -568,68 +568,72 @@ class ResolverSpoke:
         provider = api_cfg.get("provider", "google")
         model = api_cfg.get("model", "gemini-2.5-flash")
         
-        prompt = f"""An infrastructure or environment error occurred while running tests/lint. 
+        feedback = ""
+        for attempt in range(2):
+            prompt = f"""An infrastructure or environment error occurred while running tests/lint. 
 Diagnose the error and provide the exact bash commands to fix it.
 
 ERROR OUTPUT:
 {error_output}
-
+{feedback}
 Output ONLY a single ```bash block containing the necessary commands. Do not write anything else."""
-        
-        print(f"🤖 ResolverSpoke analyzing environment error (using {model})...")
-        res = await call_model_api(
-            provider=provider,
-            model=model,
-            prompt=prompt,
-            system_instruction="You are a DevOps troubleshooting agent. Output only bash commands inside a ```bash block.",
-            cwd=self.plan_dir
-        )
-        
-        if not res and "fallback" in api_cfg:
-            fb = api_cfg["fallback"]
-            print(f"🔄 Resolver API failed. Falling back to {fb.get('model')}...")
+            
+            print(f"🤖 ResolverSpoke analyzing environment error (attempt {attempt+1}/2, using {model})...")
             res = await call_model_api(
-                provider=fb.get("provider", "google"),
-                model=fb.get("model", "gemini-2.5-flash"),
+                provider=provider,
+                model=model,
                 prompt=prompt,
                 system_instruction="You are a DevOps troubleshooting agent. Output only bash commands inside a ```bash block.",
                 cwd=self.plan_dir
             )
             
-        if not res:
-            return False
-            
-        match = re.search(r'```[a-zA-Z]*\s*\n(.*?)```', res, re.DOTALL)
-        if not match:
-            print("⚠️ ResolverSpoke returned no bash block.")
-            return False
-            
-        bash_script = match.group(1).strip()
-        if not bash_script:
-            return False
-            
-        print(f"\n--- RESOLVER AGENT PROPOSED FIX ---\n{bash_script}\n-----------------------------------\n")
-        
-        if self.require_approval:
-            ans = input("❓ Do you approve running these commands? [Y/n] ").strip().lower()
-            if ans == 'n':
-                print("❌ Resolver fix rejected.")
+            if not res and "fallback" in api_cfg:
+                fb = api_cfg["fallback"]
+                print(f"🔄 Resolver API failed. Falling back to {fb.get('model')}...")
+                res = await call_model_api(
+                    provider=fb.get("provider", "google"),
+                    model=fb.get("model", "gemini-2.5-flash"),
+                    prompt=prompt,
+                    system_instruction="You are a DevOps troubleshooting agent. Output only bash commands inside a ```bash block.",
+                    cwd=self.plan_dir
+                )
+                
+            if not res:
                 return False
                 
-        print("🚀 Executing Resolver commands...")
-        script_path = os.path.join(self.plan_dir, ".resolver_fix.sh")
-        with open(script_path, "w") as f:
-            f.write(bash_script)
-        
-        stdout, stderr, code = run_cmd(["bash", ".resolver_fix.sh"], cwd=self.plan_dir)
-        os.remove(script_path)
-        
-        if code == 0:
-            print("✅ Resolver successfully executed the fix.")
-            return True
-        else:
-            print(f"❌ Resolver fix failed with exit code {code}:\n{stderr}")
-            return False
+            match = re.search(r'```[a-zA-Z]*\s*\n(.*?)```', res, re.DOTALL)
+            if not match:
+                print("⚠️ ResolverSpoke returned no bash block.")
+                return False
+                
+            bash_script = match.group(1).strip()
+            if not bash_script:
+                return False
+                
+            print(f"\n--- RESOLVER AGENT PROPOSED FIX ---\n{bash_script}\n-----------------------------------\n")
+            
+            if self.require_approval:
+                ans = input("❓ Do you approve running these commands? [Y/n] ").strip().lower()
+                if ans == 'n':
+                    print("❌ Resolver fix rejected.")
+                    return False
+                    
+            print("🚀 Executing Resolver commands...")
+            script_path = os.path.join(self.plan_dir, ".resolver_fix.sh")
+            with open(script_path, "w") as f:
+                f.write(bash_script)
+            
+            stdout, stderr, code = run_cmd(["bash", ".resolver_fix.sh"], cwd=self.plan_dir)
+            os.remove(script_path)
+            
+            if code == 0:
+                print("✅ Resolver successfully executed the fix.")
+                return True
+            else:
+                print(f"❌ Resolver fix failed with exit code {code}:\n{stderr}")
+                feedback = f"\n\nPREVIOUS FIX ATTEMPT FAILED:\nYou ran:\n```bash\n{bash_script}\n```\nIt failed with exit code {code} and this output:\n{stderr}\nPlease provide an updated bash script to fix this."
+                
+        return False
 
 
 class TestRunnerSpoke:
