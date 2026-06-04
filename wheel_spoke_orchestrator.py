@@ -1346,6 +1346,7 @@ async def run_orchestrator(args):
     pr_builder = PRBuilderSpoke(repo, plan_dir, dry_run=args.dry_run)
     test_runner = TestRunnerSpoke(plan_dir, dry_run=args.dry_run)
     code_reviewer = CodeReviewerSpoke(config["code_reviewer"], plan_dir=plan_dir, dry_run=args.dry_run)
+    resolver_spoke = ResolverSpoke(config, plan_dir, dry_run=args.dry_run)
     test_builder = TestBuilderSpoke(
         config["test_builder"], plan_dir,
         repo=repo, plan_path=args.plan, jules_handle=args.jules_handle,
