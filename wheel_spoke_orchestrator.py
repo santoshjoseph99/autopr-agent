@@ -550,6 +550,87 @@ def auto_remediate_environment(plan_dir: str, error_output: str) -> bool:
     return remediated
 
 
+class ResolverSpoke:
+    def __init__(self, config, plan_dir, dry_run=False):
+        self.config = config.get("resolver", {})
+        self.plan_dir = plan_dir
+        self.dry_run = dry_run
+        self.require_approval = self.config.get("require_approval", False)
+
+    async def resolve(self, error_output: str) -> bool:
+        if self.dry_run:
+            print("[DRY-RUN] ResolverSpoke: Simulating resolution.")
+            return True
+
+        api_cfg = self.config
+        provider = api_cfg.get("provider", "google")
+        model = api_cfg.get("model", "gemini-2.5-flash")
+        
+        prompt = f"""An infrastructure or environment error occurred while running tests/lint. 
+Diagnose the error and provide the exact bash commands to fix it.
+
+ERROR OUTPUT:
+{error_output}
+
+Output ONLY a single ```bash block containing the necessary commands. Do not write anything else."""
+        
+        print(f"🤖 ResolverSpoke analyzing environment error (using {model})...")
+        res = await call_model_api(
+            provider=provider,
+            model=model,
+            prompt=prompt,
+            system_instruction="You are a DevOps troubleshooting agent. Output only bash commands inside a ```bash block.",
+            cwd=self.plan_dir
+        )
+        
+        if not res and "fallback" in api_cfg:
+            fb = api_cfg["fallback"]
+            print(f"🔄 Resolver API failed. Falling back to {fb.get('model')}...")
+            res = await call_model_api(
+                provider=fb.get("provider", "google"),
+                model=fb.get("model", "gemini-2.5-flash"),
+                prompt=prompt,
+                system_instruction="You are a DevOps troubleshooting agent. Output only bash commands inside a ```bash block.",
+                cwd=self.plan_dir
+            )
+            
+        if not res:
+            return False
+            
+        match = re.search(r'```(?:bash|sh)?\\n(.*?)```', res, re.DOTALL)
+        if not match:
+            print("⚠️ ResolverSpoke returned no bash block.")
+            return False
+            
+        bash_script = match.group(1).strip()
+        if not bash_script:
+            return False
+            
+        print(f"\n--- RESOLVER AGENT PROPOSED FIX ---\n{bash_script}\n-----------------------------------\n")
+        
+        if self.require_approval:
+            ans = input("❓ Do you approve running these commands? [Y/n] ").strip().lower()
+            if ans == 'n':
+                print("❌ Resolver fix rejected.")
+                return False
+                
+        print("🚀 Executing Resolver commands...")
+        script_path = os.path.join(self.plan_dir, ".resolver_fix.sh")
+        with open(script_path, "w") as f:
+            f.write(bash_script)
+        
+        stdout, stderr, code = run_cmd(["bash", ".resolver_fix.sh"], cwd=self.plan_dir)
+        import os
+        os.remove(script_path)
+        
+        if code == 0:
+            print("✅ Resolver successfully executed the fix.")
+            return True
+        else:
+            print(f"❌ Resolver fix failed with exit code {code}:\n{stderr}")
+            return False
+
+
 class TestRunnerSpoke:
     def __init__(self, plan_dir, dry_run=False):
         self.plan_dir = plan_dir
@@ -1383,6 +1464,8 @@ async def run_orchestrator(args):
                     fixed = False
                 else:
                     fixed = auto_remediate_environment(plan_dir, all_err_text)
+                    if not fixed:
+                        fixed = await resolver_spoke.resolve(all_err_text)
                     
                 if fixed:
                     state["env_remediations"] = state.get("env_remediations", 0) + 1

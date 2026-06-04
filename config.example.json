@@ -1,6 +1,5 @@
 {
   "gemini_api_key": "YOUR_GEMINI_API_KEY",
-
   "code_builder": {
     "provider": "google",
     "model": "gemini-2.5-flash",
@@ -9,44 +8,47 @@
       "model": "gemini-2.5-flash"
     }
   },
-
   "test_builder": {
     "provider": "google",
     "model": "jules"
   },
-
   "code_reviewer": {
     "provider": "google",
     "model": "gemini-2.5-flash"
   },
-
   "_examples_comment": "Swap any spoke above to use a different provider. Examples below:",
-
   "_openai_example": {
     "provider": "openai",
     "model": "gpt-4o-mini",
     "_note": "Set OPENAI_API_KEY env var or add openai_api_key here"
   },
-
   "_ollama_fast": {
     "provider": "ollama",
     "model": "qwen2.5-coder:7b",
     "timeout": 180,
     "_note": "Local model, no API key. Fast, ~4.7 GB"
   },
-
   "_ollama_quality": {
     "provider": "ollama",
     "model": "qwen2.5-coder:32b-instruct-q4_K_M",
     "timeout": 600,
     "_note": "Local model, no API key. Best quality, ~19 GB, slower"
   },
-
   "_openai_compatible_example": {
     "provider": "openai_compatible",
     "model": "deepseek-coder-v2",
     "base_url": "https://api.deepseek.com/v1",
     "api_key_env": "DEEPSEEK_API_KEY",
     "_note": "Any OpenAI-format API: Together, Fireworks, DeepSeek, LiteLLM, etc."
+  },
+  "resolver": {
+    "provider": "google",
+    "model": "gemini-2.5-flash",
+    "require_approval": false,
+    "fallback": {
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "timeout": 180
+    }
   }
 }
