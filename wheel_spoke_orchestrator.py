@@ -513,6 +513,8 @@ _ENV_ERROR_PATTERNS = [
     "gyp err!",
     "node-pre-gyp err!",
     "prebuild-install",
+    "command not found",
+    "not recognized as an internal or external command",
 ]
 
 
