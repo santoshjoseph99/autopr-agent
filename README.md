@@ -3,7 +3,7 @@
 > **Autonomous multi-agent orchestrator that reads your plan and ships code — writing, testing, reviewing, and merging PRs without you lifting a finger.**
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue?logo=python)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/your-org/autopr-agent/ci.yml?branch=main)](https://github.com/your-org/autopr-agent/actions)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
@@ -432,11 +432,14 @@ python3 wheel_spoke_orchestrator.py --plan ~/plans/frontend-sprint.md --repo my-
 
 Most AI coding tools are interactive — they wait for you to review and approve each step. That's great for exploratory work, but it doesn't scale when you have a backlog of 20 well-defined tasks and you'd rather not babysit a terminal all day.
 
-`autopr-agent` is built on the premise that **a well-written task description is enough context for an agent to ship production-quality code end-to-end**. The retry loop with lint + review feedback replicates the developer inner loop (write → test → review → fix) automatically, so the agent can self-correct without human checkpointing.
+More importantly, it solves the problem of **AI service outages and credit exhaustion**. We call this **"Tokenmaxxing"** (optimizing the yield of your AI credits). By abstracting the roles into a Wheel-and-Spoke model, the orchestrator routes tasks intelligently:
+- Expensive/high-quota agents (like Google Jules or GPT-4o) are used *only* for the hardest tasks (like generating test coverage).
+- Cheap/limitless models (like Gemini 2.5 Flash) handle the bulk code building.
+- Free local models (like Ollama) act as fallback safety nets when cloud providers drop or rate limits are hit.
 
-It was designed to run overnight or over a lunch break — you come back to a GitHub repo with merged PRs, green CI, and a fully updated plan file.
+If an API drops, `autopr-agent` doesn't crash your sprint — it gracefully falls back to the next provider, ensuring your code gets shipped even during outages.
 
-**This is different from interactive pair-programming tools.** It's closer to hiring a contractor, handing them a spec, and checking back when they're done.
+**This is different from interactive pair-programming tools.** It's closer to hiring a resilient contractor, handing them a spec, and checking back when they're done.
 
 ---
 
@@ -478,7 +481,7 @@ Contributions are very welcome! Please read [`CONTRIBUTING.md`](CONTRIBUTING.md)
 
 ## License
 
-MIT © autopr-agent contributors
+Apache License 2.0 © autopr-agent contributors
 
 See [`LICENSE`](LICENSE) for the full text.
 
