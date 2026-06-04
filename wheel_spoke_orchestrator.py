@@ -527,7 +527,8 @@ def auto_remediate_environment(plan_dir: str, error_output: str) -> bool:
     if ("@rollup/rollup-darwin" in error_output or
             "npm has a bug related to optional dependencies" in error_output or
             "rollup-darwin" in error_output):
-        print("🔧 Detected broken rollup native binding. Running npm install...")
+        print("🔧 Detected broken rollup native binding. Wiping node_modules and reinstalling...")
+        run_cmd(["rm", "-rf", "node_modules", "package-lock.json"], cwd=plan_dir)
         run_cmd(["npm", "install"], cwd=plan_dir)
         run_cmd(["npm", "rebuild"], cwd=plan_dir)
         remediated = True
