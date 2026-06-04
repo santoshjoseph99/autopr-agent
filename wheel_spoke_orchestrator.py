@@ -1364,8 +1364,7 @@ async def run_orchestrator(args):
             # --- Environment issues: auto-remediate, don't send to code builder ---
             if env_failures:
                 all_err_text = test_runner.format_failures(env_failures)
-                print(f"
-🔧 Environment issue detected — attempting auto-remediation...")
+                print(f"\\n🔧 Environment issue detected — attempting auto-remediation...")
                 
                 if state.get("env_remediations", 0) >= 2:
                     print("⚠️ Max environment remediations (2) reached. Treating as code failure.")
