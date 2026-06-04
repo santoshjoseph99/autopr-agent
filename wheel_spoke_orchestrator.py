@@ -622,7 +622,6 @@ Output ONLY a single ```bash block containing the necessary commands. Do not wri
             f.write(bash_script)
         
         stdout, stderr, code = run_cmd(["bash", ".resolver_fix.sh"], cwd=self.plan_dir)
-        import os
         os.remove(script_path)
         
         if code == 0:
