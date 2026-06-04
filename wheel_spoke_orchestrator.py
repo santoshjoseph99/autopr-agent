@@ -576,7 +576,7 @@ class TestRunnerSpoke:
             print("[DRY-RUN] TestRunner: Simulating SUCCESS.")
             return {"code_failures": [], "env_failures": []}
 
-        print("\ud83e\uddea Running local validation tests (lint and unit tests)...")
+        print("🧪 Running local validation tests (lint and unit tests)...")
         verifications = []
 
         pkg_path = os.path.join(self.plan_dir, "package.json")
