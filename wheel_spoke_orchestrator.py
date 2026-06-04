@@ -768,8 +768,13 @@ class TestBuilderSpoke:
                     await asyncio.sleep(POLL_INTERVAL)
 
         # --- LLM API path (fallback or when model != jules) ---
-        api_model = self.config.get("model") if self.config.get("model") != "jules" else "gemini-1.5-flash"
-        api_provider = self.config.get("provider", "google")
+        fallback_cfg = self.config.get("fallback", {})
+        if self.config.get("model") == "jules":
+            api_model = fallback_cfg.get("model", "gemini-1.5-flash")
+            api_provider = fallback_cfg.get("provider", "google")
+        else:
+            api_model = self.config.get("model")
+            api_provider = self.config.get("provider", "google")
         prompt = f"""Given the following task description and the implementation diff, write comprehensive unit or integration tests.
 
 TASK DESCRIPTION:
@@ -1359,15 +1364,23 @@ async def run_orchestrator(args):
             # --- Environment issues: auto-remediate, don't send to code builder ---
             if env_failures:
                 all_err_text = test_runner.format_failures(env_failures)
-                print(f"\n🔧 Environment issue detected — attempting auto-remediation...")
-                fixed = auto_remediate_environment(plan_dir, all_err_text)
+                print(f"
+🔧 Environment issue detected — attempting auto-remediation...")
+                
+                if state.get("env_remediations", 0) >= 2:
+                    print("⚠️ Max environment remediations (2) reached. Treating as code failure.")
+                    fixed = False
+                else:
+                    fixed = auto_remediate_environment(plan_dir, all_err_text)
+                    
                 if fixed:
+                    state["env_remediations"] = state.get("env_remediations", 0) + 1
                     print("✅ Remediation applied. Re-running tests (code builder NOT invoked).")
                     # Don't reset pr_number or tests_generated — just retry the test step
                     save_state(state, state_file)
                     continue  # loop back — code builder skipped (pr_number still set)
                 else:
-                    print("\u26a0\ufe0f Could not auto-remediate. Treating as code failure for retry.")
+                    print("⚠️ Could not auto-remediate. Treating as code failure for retry.")
                     code_failures = env_failures  # fall through to normal retry
 
             if code_failures:
@@ -1402,6 +1415,7 @@ async def run_orchestrator(args):
                     state["pr_branch"] = None
                     state["pr_number"] = None
                     state["loop_count"] = 0
+                    state["env_remediations"] = 0
                     state["tests_generated"] = False
                     save_state(state, state_file)
                     break
@@ -1442,6 +1456,7 @@ async def run_orchestrator(args):
                     state["pr_branch"] = None
                     state["pr_number"] = None
                     state["loop_count"] = 0
+                    state["env_remediations"] = 0
                     state["tests_generated"] = False
                     save_state(state, state_file)
                 else:
@@ -1456,6 +1471,7 @@ async def run_orchestrator(args):
                 state["pr_branch"] = None
                 state["pr_number"] = None
                 state["loop_count"] = 0
+                    state["env_remediations"] = 0
                 state["tests_generated"] = False
                 save_state(state, state_file)
             else:
