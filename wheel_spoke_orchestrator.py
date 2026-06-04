@@ -1470,7 +1470,7 @@ async def run_orchestrator(args):
                 state["pr_branch"] = None
                 state["pr_number"] = None
                 state["loop_count"] = 0
-                    state["env_remediations"] = 0
+                state["env_remediations"] = 0
                 state["tests_generated"] = False
                 save_state(state, state_file)
             else:
