@@ -599,7 +599,7 @@ Output ONLY a single ```bash block containing the necessary commands. Do not wri
         if not res:
             return False
             
-        match = re.search(r'```(?:bash|sh)?\\n(.*?)```', res, re.DOTALL)
+        match = re.search(r'```[a-zA-Z]*\s*\n(.*?)```', res, re.DOTALL)
         if not match:
             print("⚠️ ResolverSpoke returned no bash block.")
             return False
