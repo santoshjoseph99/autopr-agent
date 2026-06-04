@@ -1360,9 +1360,8 @@ async def run_orchestrator(args):
                 print(f"\n🔧 Environment issue detected — attempting auto-remediation...")
                 fixed = auto_remediate_environment(plan_dir, all_err_text)
                 if fixed:
-                    print("\u2705 Remediation applied. Re-running tests (code builder NOT invoked).")
-                    # Don't reset pr_number — just retry the test step
-                    state["tests_generated"] = False  # allow re-run of test builder too
+                    print("✅ Remediation applied. Re-running tests (code builder NOT invoked).")
+                    # Don't reset pr_number or tests_generated — just retry the test step
                     save_state(state, state_file)
                     continue  # loop back — code builder skipped (pr_number still set)
                 else:
