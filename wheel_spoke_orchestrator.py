@@ -1343,11 +1343,13 @@ async def run_orchestrator(args):
                     test_result = await test_builder.generate_tests(
                         task["description"], pr_diff_for_tests, state["pr_branch"]
                     )
-                    if test_result:
-                        state["tests_generated"] = True
-                        save_state(state, state_file)
+                    # Mark as generated/attempted so we don't endlessly retry if the API is down
+                    state["tests_generated"] = True
+                    save_state(state, state_file)
                 else:
                     print("⚠️ Could not fetch PR diff for test generation. Skipping.")
+                    state["tests_generated"] = True
+                    save_state(state, state_file)
 
             # 2d. Run local tests / lint
             test_result = test_runner.run_checks()
