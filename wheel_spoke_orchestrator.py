@@ -1475,7 +1475,7 @@ async def run_orchestrator(args):
                     continue  # loop back — code builder skipped (pr_number still set)
                 else:
                     print("⚠️ Could not auto-remediate. Treating as code failure for retry.")
-                    code_failures = env_failures  # fall through to normal retry
+                    code_failures.extend(env_failures)  # fall through to normal retry
 
             if code_failures:
                 retry_count += 1
