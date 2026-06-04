@@ -1034,6 +1034,17 @@ Rules:
             cwd=self.plan_dir
         )
 
+        if not res and "fallback" in api_cfg:
+            fb = api_cfg["fallback"]
+            print(f"🔄 Primary API failed or rate limited. Falling back to {fb.get('model')}...")
+            res = await call_model_api(
+                provider=fb.get("provider", "google"),
+                model=fb.get("model", "gemini-2.5-flash"),
+                prompt=api_prompt,
+                system_instruction="You are a senior software engineer. You MUST respond with file changes using the 'Update File: <path>' format followed by a code block. Do not respond with only prose.",
+                cwd=self.plan_dir
+            )
+
         if res:
             matches = list(re.finditer(r'Update File:\s*([^\n]+)\n+```[a-zA-Z]*\n([\s\S]*?)```', res))
             if not matches:
