@@ -506,7 +506,6 @@ _ENV_ERROR_PATTERNS = [
     "enoent",
     "cannot find module",
     "module not found",
-    "failed to resolve",
     "node_modules/.bin",
     "npm install",
     "npm ci",
