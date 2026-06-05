@@ -194,24 +194,114 @@ class OpenAIRESTProvider(AIProvider):
         self.base_url = config.get("base_url", "https://api.openai.com/v1").rstrip("/")
 
     async def _post_chat(self, url: str, api_key: str,
-                         prompt: str, system_instruction: str) -> str:
+                         prompt: str, system_instruction: str, cwd: str = None) -> str:
         messages = []
         if system_instruction:
             sys_role = "developer" if ("o1" in self.model or "o3" in self.model) else "system"
             messages.append({"role": sys_role, "content": system_instruction})
         messages.append({"role": "user", "content": prompt})
-        data    = {"model": self.model, "messages": messages}
-        if "o1" not in self.model and "o3" not in self.model:
-            data["temperature"] = self.temperature
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {api_key}"}
-        req     = urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers)
-        loop    = asyncio.get_running_loop()
-        def _do():
-            with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                return json.loads(r.read().decode())
-        res = await loop.run_in_executor(None, _do)
-        return res["choices"][0]["message"]["content"].strip()
+
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Reads the contents of a file from the repository.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Path to the file relative to the project root"}
+                        },
+                        "required": ["path"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_codebase",
+                    "description": "Searches for a string or regex pattern across the codebase.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string", "description": "Search pattern (grep syntax)"}
+                        },
+                        "required": ["pattern"]
+                    }
+                }
+            }
+        ]
+
+        while True:
+            data    = {"model": self.model, "messages": messages, "tools": tools}
+            if "o1" not in self.model and "o3" not in self.model:
+                data["temperature"] = self.temperature
+                
+            headers = {"Content-Type": "application/json",
+                       "Authorization": f"Bearer {api_key}"}
+            req     = urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers)
+            loop    = asyncio.get_running_loop()
+            
+            def _do():
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    return json.loads(r.read().decode())
+            
+            try:
+                res = await loop.run_in_executor(None, _do)
+            except urllib.error.HTTPError as e:
+                # Fallback if tools aren't supported (e.g., extremely old endpoints)
+                err_body = e.read().decode() if hasattr(e, "read") else str(e)
+                if "tools" in err_body.lower() or "unrecognized" in err_body.lower():
+                    del data["tools"]
+                    req = urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers)
+                    res = await loop.run_in_executor(None, _do)
+                else:
+                    raise e
+                    
+            message = res["choices"][0]["message"]
+            messages.append(message)
+
+            if message.get("tool_calls"):
+                for tool_call in message["tool_calls"]:
+                    fn_name = tool_call["function"]["name"]
+                    args = {}
+                    try:
+                        args = json.loads(tool_call["function"]["arguments"])
+                    except Exception:
+                        pass
+                        
+                    result_str = ""
+                    if fn_name == "read_file" and "path" in args:
+                        filepath = os.path.join(cwd or os.getcwd(), args["path"])
+                        try:
+                            with open(filepath, "r") as f:
+                                result_str = f.read()
+                        except Exception as e:
+                            result_str = f"Error reading file: {e}"
+                    elif fn_name == "search_codebase" and "pattern" in args:
+                        try:
+                            import subprocess
+                            cmd = ["grep", "-rn", args["pattern"], cwd or os.getcwd()]
+                            proc = subprocess.run(cmd, capture_output=True, text=True)
+                            result_str = proc.stdout if proc.stdout else "No matches found."
+                        except Exception as e:
+                            result_str = f"Error searching: {e}"
+                    else:
+                        result_str = f"Unknown tool or missing arguments: {fn_name}"
+
+                    # Limit tool result size to prevent token overflow
+                    if len(result_str) > 30000:
+                        result_str = result_str[:15000] + "\n... [TRUNCATED] ...\n" + result_str[-15000:]
+
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "name": fn_name,
+                        "content": result_str
+                    })
+                # Loop will repeat and send tool results back
+            else:
+                return message.get("content", "").strip()
 
     async def complete(self, prompt: str,
                        system_instruction: str = None,
@@ -220,7 +310,7 @@ class OpenAIRESTProvider(AIProvider):
             raise ValueError("OPENAI_API_KEY not set (or api_key_env misconfigured)")
         return await self._post_chat(
             f"{self.base_url}/chat/completions",
-            self.api_key, prompt, system_instruction
+            self.api_key, prompt, system_instruction, cwd
         )
 
 
@@ -242,7 +332,7 @@ class OpenAICompatibleProvider(OpenAIRESTProvider):
             raise ValueError("base_url is required for openai_compatible provider")
         return await self._post_chat(
             f"{self.base_url}/chat/completions",
-            self.api_key, prompt, system_instruction
+            self.api_key, prompt, system_instruction, cwd
         )
 
 
@@ -1044,6 +1134,32 @@ class CodeBuilderSpoke:
                 
             await asyncio.sleep(POLL_INTERVAL)
 
+    def _generate_repo_map(self, max_lines=1000):
+        """Generates a tree-like map of all source files in the project."""
+        stdout, _, code = run_cmd(
+            ["find", "src", "packages", "-type", "f", 
+             "-name", "*.ts", "-o", "-name", "*.tsx", 
+             "-not", "-path", "*/node_modules/*", 
+             "-not", "-path", "*/dist/*",
+             "-not", "-path", "*/.git/*"],
+            cwd=self.plan_dir
+        )
+        if code != 0:
+            return "(Repo map unavailable)"
+        files = stdout.strip().split("\n")
+        files.sort()
+        if len(files) > max_lines:
+            # If too large, just show the directory structure of src and packages
+            stdout_dirs, _, _ = run_cmd(
+                ["find", "src", "packages", "-type", "d",
+                 "-not", "-path", "*/node_modules/*",
+                 "-not", "-path", "*/dist/*",
+                 "-not", "-path", "*/.git/*"],
+                cwd=self.plan_dir
+            )
+            return stdout_dirs.strip()
+        return "\n".join(files)
+
     def _gather_context(self, task_description, revision_feedback=None, max_files=6, max_chars_per_file=1500):
         """Reads relevant source files to give the LLM grounding in the actual codebase."""
         context = ""
@@ -1142,6 +1258,7 @@ class CodeBuilderSpoke:
 
         # Gather relevant file context so the LLM has grounding in the real codebase
         file_context = self._gather_context(task_description, revision_feedback)
+        repo_map = self._generate_repo_map()
 
         api_prompt = f"""You are an expert software engineer implementing a task in a real TypeScript/Electron codebase.
 
@@ -1150,6 +1267,9 @@ TASK:
 
 REVISION FEEDBACK (address these if present):
 {revision_feedback or 'None'}
+
+REPO MAP (Directory structure and files):
+{repo_map}
 
 RELEVANT FILES FROM CODEBASE:
 {file_context}
@@ -1171,13 +1291,13 @@ Rules:
 - Include the COMPLETE file contents, not just diffs or snippets.
 - If a file does not need changes, do NOT include it.
 - Use the relative path from the repository root.
-- If you are not sure what to change, make your best attempt based on the task description and file context above.
+- If you are missing context for an error (e.g., missing variable definition), use your `read_file` or `search_codebase` tools to find the correct file before writing your code!
 """
         res = await call_model_api(
             provider=api_cfg.get("provider", "google"),
             model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=api_prompt,
-            system_instruction="You are a senior software engineer. You MUST respond with file changes using the 'Update File: <path>' format followed by a code block. Do not respond with only prose.",
+            system_instruction="You are a senior software engineer. If you need more context, use your tools (read_file, search_codebase) FIRST. Once you have enough context, you MUST respond with file changes using the 'Update File: <path>' format followed by a code block.",
             cwd=self.plan_dir
         )
 
