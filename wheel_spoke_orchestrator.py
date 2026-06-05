@@ -504,8 +504,6 @@ _ENV_ERROR_PATTERNS = [
     "npm has a bug related to optional dependencies",
     "please try `npm i` again after removing",
     "enoent",
-    "cannot find module",
-    "module not found",
     "node_modules/.bin",
     "npm install",
     "npm ci",
@@ -714,7 +712,7 @@ class TestRunnerSpoke:
         for f in failures:
             body += f"### {f['name']} (`{f['command']}`)\n"
             body += "```\n"
-            output = f['stderr'] if f['stderr'].strip() else f['stdout']
+            output = (f['stdout'].strip() + "\n" + f['stderr'].strip()).strip()
             lines = output.strip().split("\n")
             if len(lines) > 40:
                 output = "\n".join(lines[:20]) + "\n... [TRUNCATED] ...\n" + "\n".join(lines[-20:])
