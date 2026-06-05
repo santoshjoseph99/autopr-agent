@@ -981,13 +981,14 @@ class CodeBuilderSpoke:
                 
             await asyncio.sleep(POLL_INTERVAL)
 
-    def _gather_context(self, task_description, max_files=6, max_chars_per_file=1500):
+    def _gather_context(self, task_description, revision_feedback=None, max_files=6, max_chars_per_file=1500):
         """Reads relevant source files to give the LLM grounding in the actual codebase."""
         context = ""
         found = []
 
+        search_text = task_description + "\n" + str(revision_feedback or "")
         # 1. Find specific filenames with extensions mentioned in task
-        file_mentions = re.findall(r'[\w\-./]+\.(?:ts|tsx|js|jsx|py|json|md)', task_description)
+        file_mentions = re.findall(r'[\w\-./]+\.(?:ts|tsx|js|jsx|py|json|md)', search_text)
         for fname in file_mentions[:max_files]:
             basename = os.path.basename(fname)
             stdout, _, code = run_cmd(
@@ -1077,7 +1078,7 @@ class CodeBuilderSpoke:
         print(f"🚀 Code Builder using '{api_cfg.get('model')}' ({api_cfg.get('provider')})...")
 
         # Gather relevant file context so the LLM has grounding in the real codebase
-        file_context = self._gather_context(task_description)
+        file_context = self._gather_context(task_description, revision_feedback)
 
         api_prompt = f"""You are an expert software engineer implementing a task in a real TypeScript/Electron codebase.
 
