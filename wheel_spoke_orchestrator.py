@@ -717,8 +717,9 @@ class TestRunnerSpoke:
             body += "```\n"
             output = (f['stdout'].strip() + "\n" + f['stderr'].strip()).strip()
             lines = output.strip().split("\n")
-            if len(lines) > 40:
-                output = "\n".join(lines[:20]) + "\n... [TRUNCATED] ...\n" + "\n".join(lines[-20:])
+            # Increase limit dramatically so we don't truncate the actual test failures
+            if len(lines) > 300:
+                output = "\n".join(lines[:50]) + "\n... [TRUNCATED] ...\n" + "\n".join(lines[-250:])
             body += output
             body += "\n```\n\n"
         return body
