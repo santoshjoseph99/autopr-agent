@@ -895,6 +895,65 @@ File: packages/<package>/tests/my-test.spec.ts
         return None
 
 
+# --- Spoke: Router (LLM State Machine) ---
+class RouterSpoke:
+    def __init__(self, plan_dir, dry_run=False):
+        self.plan_dir = plan_dir
+        self.dry_run = dry_run
+        
+    async def decide_next_step(self, task_description, state_summary, last_action_result):
+        if self.dry_run:
+            print("[DRY-RUN] RouterSpoke simulating next step...")
+            return "CodeBuilder"
+            
+        system_instruction = """You are the Router Agent for the Wheel-and-Spoke Orchestrator.
+Your job is to read the current state of a software engineering task and decide which specialized agent (Spoke) to invoke next.
+
+Available Spokes:
+1. CodeBuilder: Writes application code based on task requirements and feedback. Use this when code needs to be written or fixed.
+2. TestRunner: Runs local linters and unit tests (npm test, npm run lint). Use this AFTER code is written to verify it.
+3. Resolver: Fixes infrastructure/environment errors (e.g. missing node modules, missing commands). Use this ONLY when TestRunner reports an environment error.
+4. CodeReviewer: Reviews the final code diff against the task description. Use this ONLY after TestRunner confirms all tests pass.
+5. Exit: Use this if the task is impossible, or if the loop is stuck in an infinite failure cycle.
+
+You MUST respond with exactly one line containing the next spoke to invoke. For example:
+NEXT: CodeBuilder
+NEXT: TestRunner
+NEXT: Resolver
+NEXT: CodeReviewer
+NEXT: Exit
+"""
+        prompt = f"""TASK: {task_description}
+
+STATE SUMMARY:
+{state_summary}
+
+LAST ACTION RESULT:
+{last_action_result}
+
+What is the next Spoke to invoke?"""
+        
+        print("🧠 RouterSpoke analyzing state to decide next step...")
+        # Hardcoding openai/gpt-4o-mini as per user approval for speed/cost.
+        res = await call_model_api(
+            provider="openai",
+            model="gpt-4o-mini",
+            prompt=prompt,
+            system_instruction=system_instruction,
+            cwd=self.plan_dir
+        )
+        
+        if res:
+            match = re.search(r'NEXT:\s*([A-Za-z]+)', res)
+            if match:
+                decision = match.group(1).strip()
+                print(f"🔀 Router decision: {decision}")
+                return decision
+        
+        print(f"⚠️ Router failed to return a valid spoke. Raw response: {res}")
+        return "Exit"
+
+
 # --- Spoke: Code Builder (Jules & Direct LLM Fallbacks) ---
 class CodeBuilderSpoke:
     def __init__(self, config, repo, plan_path, plan_dir, jules_handle, dry_run=False):
@@ -1355,6 +1414,153 @@ async def run_orchestrator(args):
     )
     code_builder = CodeBuilderSpoke(config["code_builder"], repo, args.plan, plan_dir, args.jules_handle, dry_run=args.dry_run)
 
+async def run_router_loop(task, state, state_file, plan_dir, repo, args,
+                          code_builder, pr_builder, test_runner, resolver_spoke, test_builder, code_reviewer):
+    router_spoke = RouterSpoke(plan_dir, dry_run=args.dry_run)
+    state_summary = f"Task {task['number']} started. Code has not been written yet. Start by using CodeBuilder."
+    last_action_result = "No actions taken yet."
+    
+    router_iterations = 0
+    max_iterations = 20
+    
+    while router_iterations < max_iterations:
+        router_iterations += 1
+        print(f"\\n--- ROUTER ITERATION {router_iterations}/{max_iterations} ---")
+        
+        decision = await router_spoke.decide_next_step(task["description"], state_summary, last_action_result)
+        
+        if decision == "CodeBuilder":
+            feedback = None
+            if "failed" in last_action_result.lower() or "error" in last_action_result.lower() or "rejected" in last_action_result.lower():
+                feedback = last_action_result
+
+            build_res = await code_builder.implement_task(
+                task["description"],
+                revision_feedback=feedback,
+                pr_branch=state["pr_branch"],
+                pr_number=state.get("pr_number")
+            )
+            
+            if build_res.get("mode") == "fallback":
+                print("💾 Committing API changes locally...")
+                if not args.dry_run:
+                    run_cmd(["git", "add", "."], cwd=plan_dir)
+                    run_cmd(["git", "commit", "--no-verify", "-m", f"feat: implement task {task['number']} via Router fallback"], cwd=plan_dir)
+                    run_cmd(["git", "push", "origin", state["pr_branch"], "--no-verify"], cwd=plan_dir)
+                
+                if not state.get("pr_number"):
+                    pr_num = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], "Gemini API")
+                    if pr_num:
+                        state["pr_number"] = pr_num
+                        save_state(state, state_file)
+                
+                state_summary = "Code was written and pushed to the branch. You should now use TestRunner to verify."
+                last_action_result = "Code successfully built and pushed."
+            else:
+                state_summary = "CodeBuilder failed to write changes."
+                last_action_result = f"CodeBuilder error: {build_res.get('reason', 'Unknown')}"
+                
+        elif decision == "TestRunner":
+            test_result = test_runner.run_checks()
+            env_failures = test_result.get("env_failures", [])
+            code_failures = test_result.get("code_failures", [])
+            
+            if env_failures:
+                last_action_result = test_runner.format_failures(env_failures)
+                state_summary = "Tests failed due to an environment/toolchain error. You MUST use Resolver next."
+            elif code_failures:
+                last_action_result = test_runner.format_failures(code_failures)
+                state_summary = "Tests failed due to code bugs. You MUST use CodeBuilder next to fix them."
+                state["pr_number"] = None
+                save_state(state, state_file)
+            else:
+                last_action_result = "All lint checks and unit tests passed successfully."
+                state_summary = "Tests passed. You should now use CodeReviewer to review the PR diff."
+                
+        elif decision == "Resolver":
+            fixed = auto_remediate_environment(plan_dir, last_action_result)
+            if not fixed:
+                fixed = await resolver_spoke.resolve(last_action_result)
+            
+            if fixed:
+                last_action_result = "Environment was successfully remediated."
+                state_summary = "Environment fixed. You MUST use TestRunner next to re-run the tests."
+            else:
+                last_action_result = "Resolver failed to fix the environment."
+                state_summary = "Environment is permanently broken. Cannot proceed."
+                
+        elif decision == "CodeReviewer":
+            if not state.get("pr_number"):
+                last_action_result = "No PR exists to review."
+                state_summary = "Cannot review because PR does not exist."
+                continue
+                
+            diff = pr_builder.get_pr_diff(state["pr_number"])
+            if not diff:
+                last_action_result = "Failed to get PR diff."
+                continue
+                
+            review_res = await code_reviewer.review_diff(task["description"], diff)
+            last_action_result = review_res
+            
+            if "APPROVED" in review_res.upper() and "NOT APPROVED" not in review_res.upper() and "REJECTED" not in review_res.upper():
+                print(f"✅ Code review APPROVED for Task {task['number']}!")
+                if pr_builder.merge_pr(state["pr_number"], args.merge_method):
+                    sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
+                    send_notification("Task Completed", f"Task {task['number']} merged!")
+                    
+                    state["completed_tasks"].append(task["number"])
+                    state["current_task_idx"] += 1
+                    state["pr_branch"] = None
+                    state["pr_number"] = None
+                    save_state(state, state_file)
+                    return True
+                else:
+                    last_action_result = "Failed to merge PR."
+                    state_summary = "PR Merge failed."
+            else:
+                state_summary = "Code review rejected. You MUST use CodeBuilder to address the feedback."
+                state["pr_number"] = None
+                save_state(state, state_file)
+                
+        elif decision == "Exit":
+            print(f"\\n\u26a0\ufe0f Router elected to Exit for Task {task['number']}.")
+            break
+            
+        else:
+            print(f"⚠️ Unknown Router decision: {decision}")
+            break
+
+    print(f"\\n\u26a0\ufe0f Router hit loop limit or elected to exit for Task {task['number']}.")
+    print("Select recovery action:")
+    print("  [A] Approve and merge PR manually")
+    print("  [S] Skip this task and continue to next")
+    print("  [E] Exit orchestrator")
+    choice = input("Choice: ").strip().lower()
+    if choice == "a":
+        pr_number, _ = pr_builder.find_pr_for_task(task["number"])
+        if pr_number and pr_builder.merge_pr(pr_number, args.merge_method):
+            sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
+            state["completed_tasks"].append(task["number"])
+            state["current_task_idx"] += 1
+            state["pr_branch"] = None
+            state["pr_number"] = None
+            save_state(state, state_file)
+        else:
+            print("\u274c Failed to resolve PR manually. Exiting.")
+            sys.exit(1)
+    elif choice == "s":
+        sync_and_tag_plan(args.plan, task["number"], tag="SKIPPED", dry_run=args.dry_run)
+        state["completed_tasks"].append(task["number"])
+        state["current_task_idx"] += 1
+        state["pr_branch"] = None
+        state["pr_number"] = None
+        save_state(state, state_file)
+    else:
+        sys.exit(1)
+    
+    return False
+
     while state["current_task_idx"] < len(tasks):
         idx = state["current_task_idx"]
         task = tasks[idx]
@@ -1371,7 +1577,12 @@ async def run_orchestrator(args):
             pr_builder.checkout_branch(state["pr_branch"], create=True)
             save_state(state, state_file)
 
-        # 2. Outer loop: Retrying Code Builder + Verifications
+        if args.mode == "router":
+            await run_router_loop(task, state, state_file, plan_dir, repo, args,
+                                  code_builder, pr_builder, test_runner, resolver_spoke, test_builder, code_reviewer)
+            continue
+            
+        # 2. Outer loop: Retrying Code Builder + Verifications (Deterministic Mode)
         retry_count = 0
         feedback = None
         while retry_count < 5:
@@ -1589,6 +1800,7 @@ if __name__ == "__main__":
     parser.add_argument("--start-task", type=int, help="Task number to start/resume from")
     parser.add_argument("--jules-handle", default="@jules", help="Jules bot handle")
     parser.add_argument("--dry-run", action="store_true", help="Run the orchestrator loop with mocked spoke responses for verification")
+    parser.add_argument("--mode", choices=["deterministic", "router"], default="router", help="Execution mode (router uses LLM for state transitions)")
 
     args = parser.parse_args()
     asyncio.run(run_orchestrator(args))
