@@ -197,9 +197,12 @@ class OpenAIRESTProvider(AIProvider):
                          prompt: str, system_instruction: str) -> str:
         messages = []
         if system_instruction:
-            messages.append({"role": "system", "content": system_instruction})
+            sys_role = "developer" if ("o1" in self.model or "o3" in self.model) else "system"
+            messages.append({"role": sys_role, "content": system_instruction})
         messages.append({"role": "user", "content": prompt})
-        data    = {"model": self.model, "messages": messages, "temperature": self.temperature}
+        data    = {"model": self.model, "messages": messages}
+        if "o1" not in self.model and "o3" not in self.model:
+            data["temperature"] = self.temperature
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {api_key}"}
         req     = urllib.request.Request(url, data=json.dumps(data).encode(), headers=headers)
@@ -1414,152 +1417,152 @@ async def run_orchestrator(args):
     )
     code_builder = CodeBuilderSpoke(config["code_builder"], repo, args.plan, plan_dir, args.jules_handle, dry_run=args.dry_run)
 
-async def run_router_loop(task, state, state_file, plan_dir, repo, args,
-                          code_builder, pr_builder, test_runner, resolver_spoke, test_builder, code_reviewer):
-    router_spoke = RouterSpoke(plan_dir, dry_run=args.dry_run)
-    state_summary = f"Task {task['number']} started. Code has not been written yet. Start by using CodeBuilder."
-    last_action_result = "No actions taken yet."
+    async def run_router_loop(task, state, state_file, plan_dir, repo, args,
+                              code_builder, pr_builder, test_runner, resolver_spoke, test_builder, code_reviewer):
+        router_spoke = RouterSpoke(plan_dir, dry_run=args.dry_run)
+        state_summary = f"Task {task['number']} started. Code has not been written yet. Start by using CodeBuilder."
+        last_action_result = "No actions taken yet."
     
-    router_iterations = 0
-    max_iterations = 20
+        router_iterations = 0
+        max_iterations = 20
     
-    while router_iterations < max_iterations:
-        router_iterations += 1
-        print(f"\\n--- ROUTER ITERATION {router_iterations}/{max_iterations} ---")
+        while router_iterations < max_iterations:
+            router_iterations += 1
+            print(f"\\n--- ROUTER ITERATION {router_iterations}/{max_iterations} ---")
         
-        decision = await router_spoke.decide_next_step(task["description"], state_summary, last_action_result)
+            decision = await router_spoke.decide_next_step(task["description"], state_summary, last_action_result)
         
-        if decision == "CodeBuilder":
-            feedback = None
-            if "failed" in last_action_result.lower() or "error" in last_action_result.lower() or "rejected" in last_action_result.lower():
-                feedback = last_action_result
+            if decision == "CodeBuilder":
+                feedback = None
+                if "failed" in last_action_result.lower() or "error" in last_action_result.lower() or "rejected" in last_action_result.lower():
+                    feedback = last_action_result
 
-            build_res = await code_builder.implement_task(
-                task["description"],
-                revision_feedback=feedback,
-                pr_branch=state["pr_branch"],
-                pr_number=state.get("pr_number")
-            )
+                build_res = await code_builder.implement_task(
+                    task["description"],
+                    revision_feedback=feedback,
+                    pr_branch=state["pr_branch"],
+                    pr_number=state.get("pr_number")
+                )
             
-            if build_res.get("mode") == "fallback":
-                print("💾 Committing API changes locally...")
-                if not args.dry_run:
-                    run_cmd(["git", "add", "."], cwd=plan_dir)
-                    run_cmd(["git", "commit", "--no-verify", "-m", f"feat: implement task {task['number']} via Router fallback"], cwd=plan_dir)
-                    run_cmd(["git", "push", "origin", state["pr_branch"], "--no-verify"], cwd=plan_dir)
+                if build_res.get("mode") == "fallback":
+                    print("💾 Committing API changes locally...")
+                    if not args.dry_run:
+                        run_cmd(["git", "add", "."], cwd=plan_dir)
+                        run_cmd(["git", "commit", "--no-verify", "-m", f"feat: implement task {task['number']} via Router fallback"], cwd=plan_dir)
+                        run_cmd(["git", "push", "origin", state["pr_branch"], "--no-verify"], cwd=plan_dir)
                 
-                if not state.get("pr_number"):
-                    pr_num = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], "Gemini API")
-                    if pr_num:
-                        state["pr_number"] = pr_num
-                        save_state(state, state_file)
+                    if not state.get("pr_number"):
+                        pr_num = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], "Gemini API")
+                        if pr_num:
+                            state["pr_number"] = pr_num
+                            save_state(state, state_file)
                 
-                state_summary = "Code was written and pushed to the branch. You should now use TestRunner to verify."
-                last_action_result = "Code successfully built and pushed."
-            else:
-                state_summary = "CodeBuilder failed to write changes."
-                last_action_result = f"CodeBuilder error: {build_res.get('reason', 'Unknown')}"
+                    state_summary = "Code was written and pushed to the branch. You should now use TestRunner to verify."
+                    last_action_result = "Code successfully built and pushed."
+                else:
+                    state_summary = "CodeBuilder failed to write changes."
+                    last_action_result = f"CodeBuilder error: {build_res.get('reason', 'Unknown')}"
                 
-        elif decision == "TestRunner":
-            test_result = test_runner.run_checks()
-            env_failures = test_result.get("env_failures", [])
-            code_failures = test_result.get("code_failures", [])
+            elif decision == "TestRunner":
+                test_result = test_runner.run_checks()
+                env_failures = test_result.get("env_failures", [])
+                code_failures = test_result.get("code_failures", [])
             
-            if env_failures:
-                last_action_result = test_runner.format_failures(env_failures)
-                state_summary = "Tests failed due to an environment/toolchain error. You MUST use Resolver next."
-            elif code_failures:
-                last_action_result = test_runner.format_failures(code_failures)
-                state_summary = "Tests failed due to code bugs. You MUST use CodeBuilder next to fix them."
-                state["pr_number"] = None
-                save_state(state, state_file)
-            else:
-                last_action_result = "All lint checks and unit tests passed successfully."
-                state_summary = "Tests passed. You should now use CodeReviewer to review the PR diff."
-                
-        elif decision == "Resolver":
-            fixed = auto_remediate_environment(plan_dir, last_action_result)
-            if not fixed:
-                fixed = await resolver_spoke.resolve(last_action_result)
-            
-            if fixed:
-                last_action_result = "Environment was successfully remediated."
-                state_summary = "Environment fixed. You MUST use TestRunner next to re-run the tests."
-            else:
-                last_action_result = "Resolver failed to fix the environment."
-                state_summary = "Environment is permanently broken. Cannot proceed."
-                
-        elif decision == "CodeReviewer":
-            if not state.get("pr_number"):
-                last_action_result = "No PR exists to review."
-                state_summary = "Cannot review because PR does not exist."
-                continue
-                
-            diff = pr_builder.get_pr_diff(state["pr_number"])
-            if not diff:
-                last_action_result = "Failed to get PR diff."
-                continue
-                
-            review_res = await code_reviewer.review_diff(task["description"], diff)
-            last_action_result = review_res
-            
-            if "APPROVED" in review_res.upper() and "NOT APPROVED" not in review_res.upper() and "REJECTED" not in review_res.upper():
-                print(f"✅ Code review APPROVED for Task {task['number']}!")
-                if pr_builder.merge_pr(state["pr_number"], args.merge_method):
-                    sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
-                    send_notification("Task Completed", f"Task {task['number']} merged!")
-                    
-                    state["completed_tasks"].append(task["number"])
-                    state["current_task_idx"] += 1
-                    state["pr_branch"] = None
+                if env_failures:
+                    last_action_result = test_runner.format_failures(env_failures)
+                    state_summary = "Tests failed due to an environment/toolchain error. You MUST use Resolver next."
+                elif code_failures:
+                    last_action_result = test_runner.format_failures(code_failures)
+                    state_summary = "Tests failed due to code bugs. You MUST use CodeBuilder next to fix them."
                     state["pr_number"] = None
                     save_state(state, state_file)
-                    return True
                 else:
-                    last_action_result = "Failed to merge PR."
-                    state_summary = "PR Merge failed."
+                    last_action_result = "All lint checks and unit tests passed successfully."
+                    state_summary = "Tests passed. You should now use CodeReviewer to review the PR diff."
+                
+            elif decision == "Resolver":
+                fixed = auto_remediate_environment(plan_dir, last_action_result)
+                if not fixed:
+                    fixed = await resolver_spoke.resolve(last_action_result)
+            
+                if fixed:
+                    last_action_result = "Environment was successfully remediated."
+                    state_summary = "Environment fixed. You MUST use TestRunner next to re-run the tests."
+                else:
+                    last_action_result = "Resolver failed to fix the environment."
+                    state_summary = "Environment is permanently broken. Cannot proceed."
+                
+            elif decision == "CodeReviewer":
+                if not state.get("pr_number"):
+                    last_action_result = "No PR exists to review."
+                    state_summary = "Cannot review because PR does not exist."
+                    continue
+                
+                diff = pr_builder.get_pr_diff(state["pr_number"])
+                if not diff:
+                    last_action_result = "Failed to get PR diff."
+                    continue
+                
+                review_res = await code_reviewer.review_diff(task["description"], diff)
+                last_action_result = review_res
+            
+                if "APPROVED" in review_res.upper() and "NOT APPROVED" not in review_res.upper() and "REJECTED" not in review_res.upper():
+                    print(f"✅ Code review APPROVED for Task {task['number']}!")
+                    if pr_builder.merge_pr(state["pr_number"], args.merge_method):
+                        sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
+                        send_notification("Task Completed", f"Task {task['number']} merged!")
+                    
+                        state["completed_tasks"].append(task["number"])
+                        state["current_task_idx"] += 1
+                        state["pr_branch"] = None
+                        state["pr_number"] = None
+                        save_state(state, state_file)
+                        return True
+                    else:
+                        last_action_result = "Failed to merge PR."
+                        state_summary = "PR Merge failed."
+                else:
+                    state_summary = "Code review rejected. You MUST use CodeBuilder to address the feedback."
+                    state["pr_number"] = None
+                    save_state(state, state_file)
+                
+            elif decision == "Exit":
+                print(f"\\n\u26a0\ufe0f Router elected to Exit for Task {task['number']}.")
+                break
+            
             else:
-                state_summary = "Code review rejected. You MUST use CodeBuilder to address the feedback."
+                print(f"⚠️ Unknown Router decision: {decision}")
+                break
+
+        print(f"\\n\u26a0\ufe0f Router hit loop limit or elected to exit for Task {task['number']}.")
+        print("Select recovery action:")
+        print("  [A] Approve and merge PR manually")
+        print("  [S] Skip this task and continue to next")
+        print("  [E] Exit orchestrator")
+        choice = input("Choice: ").strip().lower()
+        if choice == "a":
+            pr_number, _ = pr_builder.find_pr_for_task(task["number"])
+            if pr_number and pr_builder.merge_pr(pr_number, args.merge_method):
+                sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
+                state["completed_tasks"].append(task["number"])
+                state["current_task_idx"] += 1
+                state["pr_branch"] = None
                 state["pr_number"] = None
                 save_state(state, state_file)
-                
-        elif decision == "Exit":
-            print(f"\\n\u26a0\ufe0f Router elected to Exit for Task {task['number']}.")
-            break
-            
-        else:
-            print(f"⚠️ Unknown Router decision: {decision}")
-            break
-
-    print(f"\\n\u26a0\ufe0f Router hit loop limit or elected to exit for Task {task['number']}.")
-    print("Select recovery action:")
-    print("  [A] Approve and merge PR manually")
-    print("  [S] Skip this task and continue to next")
-    print("  [E] Exit orchestrator")
-    choice = input("Choice: ").strip().lower()
-    if choice == "a":
-        pr_number, _ = pr_builder.find_pr_for_task(task["number"])
-        if pr_number and pr_builder.merge_pr(pr_number, args.merge_method):
-            sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
+            else:
+                print("\u274c Failed to resolve PR manually. Exiting.")
+                sys.exit(1)
+        elif choice == "s":
+            sync_and_tag_plan(args.plan, task["number"], tag="SKIPPED", dry_run=args.dry_run)
             state["completed_tasks"].append(task["number"])
             state["current_task_idx"] += 1
             state["pr_branch"] = None
             state["pr_number"] = None
             save_state(state, state_file)
         else:
-            print("\u274c Failed to resolve PR manually. Exiting.")
             sys.exit(1)
-    elif choice == "s":
-        sync_and_tag_plan(args.plan, task["number"], tag="SKIPPED", dry_run=args.dry_run)
-        state["completed_tasks"].append(task["number"])
-        state["current_task_idx"] += 1
-        state["pr_branch"] = None
-        state["pr_number"] = None
-        save_state(state, state_file)
-    else:
-        sys.exit(1)
     
-    return False
+        return False
 
     while state["current_task_idx"] < len(tasks):
         idx = state["current_task_idx"]
