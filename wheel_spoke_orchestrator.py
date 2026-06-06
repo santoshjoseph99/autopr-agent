@@ -1294,12 +1294,13 @@ Rules:
 - If a file does not need changes, do NOT include it.
 - Use the relative path from the repository root.
 - If you are missing context for an error (e.g., missing variable definition), use your `read_file` or `search_codebase` tools to find the correct file before writing your code!
+- DO NOT ask the user to provide file contents. You are autonomous. If you need a file, use the `read_file` tool.
 """
         res = await call_model_api(
             provider=api_cfg.get("provider", "google"),
             model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=api_prompt,
-            system_instruction="You are a senior software engineer. If you need more context, use your tools (read_file, search_codebase) FIRST. Once you have enough context, you MUST respond with file changes using the 'Update File: <path>' format followed by a code block.",
+            system_instruction="You are a fully autonomous software engineer. If you need to read a file, YOU MUST use the `read_file` tool yourself! DO NOT ask the user to provide file contents or run commands. Once you have enough context, you MUST respond with file changes using the 'Update File: <path>' format followed by a code block.",
             cwd=self.plan_dir
         )
 
