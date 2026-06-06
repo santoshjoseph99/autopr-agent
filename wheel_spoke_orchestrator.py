@@ -272,6 +272,7 @@ class OpenAIRESTProvider(AIProvider):
                         
                     result_str = ""
                     if fn_name == "read_file" and "path" in args:
+                        print(f"   🔍 Agent is reading file: {args['path']}")
                         filepath = os.path.join(cwd or os.getcwd(), args["path"])
                         try:
                             with open(filepath, "r") as f:
@@ -279,6 +280,7 @@ class OpenAIRESTProvider(AIProvider):
                         except Exception as e:
                             result_str = f"Error reading file: {e}"
                     elif fn_name == "search_codebase" and "pattern" in args:
+                        print(f"   🔎 Agent is searching codebase for: '{args['pattern']}'")
                         try:
                             import subprocess
                             cmd = ["grep", "-rn", args["pattern"], cwd or os.getcwd()]
