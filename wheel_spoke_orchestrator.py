@@ -1294,13 +1294,13 @@ Rules:
 - If a file does not need changes, do NOT include it.
 - Use the relative path from the repository root.
 - If you are missing context for an error (e.g., missing variable definition), use your `read_file` or `search_codebase` tools to find the correct file before writing your code!
-- DO NOT ask the user to provide file contents. You are autonomous. If you need a file, use the `read_file` tool.
+- CRITICAL: DO NOT talk to the user. DO NOT ask the user for files. You are a script. Use your `read_file` JSON tool.
 """
         res = await call_model_api(
             provider=api_cfg.get("provider", "google"),
             model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=api_prompt,
-            system_instruction="You are a fully autonomous software engineer. If you need to read a file, YOU MUST use the `read_file` tool yourself! DO NOT ask the user to provide file contents or run commands. Once you have enough context, you MUST respond with file changes using the 'Update File: <path>' format followed by a code block.",
+            system_instruction="CRITICAL: You are an autonomous agent interacting with a machine API. THERE IS NO HUMAN TO TALK TO. You CANNOT ask questions or ask for file contents. If you need a file, YOU MUST use your `read_file` tool natively via JSON! If you output text asking the user for a file, the system will instantly crash. When you have enough context, you MUST output the 'Update File:' format.",
             cwd=self.plan_dir
         )
 
