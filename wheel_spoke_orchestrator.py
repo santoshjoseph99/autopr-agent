@@ -990,19 +990,96 @@ File: packages/<package>/tests/my-test.spec.ts
                 return file_path
         return None
 
+    async def generate_tdd_test(self, task_description, pr_branch=None):
+        if self.dry_run:
+            print("[DRY-RUN] TestBuilder (TDD): Simulating TDD test generation.")
+            return "mock_tdd.spec.ts"
+
+        # Explicitly use LLM API for TDD mode
+        fallback_cfg = self.config.get("fallback", {})
+        if self.config.get("model") == "jules":
+            api_model = fallback_cfg.get("model", "gemini-1.5-flash")
+            api_provider = fallback_cfg.get("provider", "google")
+        else:
+            api_model = self.config.get("model")
+            api_provider = self.config.get("provider", "google")
+            
+        prompt = f"""You are executing the first step of Test-Driven Development (TDD).
+Your job is to write a FAILING unit test for the following task description.
+DO NOT write the implementation code yet! Only write the test.
+
+TASK DESCRIPTION:
+{task_description}
+
+You have tools to read the codebase if you need to find existing test files to append to, or to check the API signature of the function you are testing.
+Output your test changes using EXACTLY this format:
+
+Update File: packages/nexus/tests/some.test.ts
+```ts
+// complete test file contents here
+```
+
+Remember: Write just enough of a test to fail (or fail to compile). Do not write more than one logical test block at a time.
+"""
+        print("🧪 Invoking Test Builder (TDD Mode)...")
+        res = await call_model_api(
+            provider=api_provider,
+            model=api_model,
+            prompt=prompt,
+            system_instruction="CRITICAL: You are an autonomous agent. Use your `read_file` tool to inspect the codebase if needed. DO NOT ask the user for files. Output exactly one 'Update File: <path>' block containing the unit test.",
+            cwd=self.plan_dir
+        )
+        if res:
+            # Reusing the Update File parsing logic from CodeBuilderSpoke
+            blocks = re.findall(r'Update File:\s*([^\n]+)\n+```[a-zA-Z]*\n([\s\S]*?)```', res)
+            if blocks:
+                for file_path, test_code in blocks:
+                    file_path = file_path.strip()
+                    abs_path = os.path.join(self.plan_dir, file_path)
+                    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+                    with open(abs_path, "w", encoding="utf-8") as f:
+                        f.write(test_code)
+                    print(f"✅ Generated TDD test file: {file_path}")
+                
+                # Commit the test locally
+                run_cmd(["git", "add", "."], cwd=self.plan_dir)
+                run_cmd(["git", "commit", "--no-verify", "-m", "test(tdd): add failing test case"], cwd=self.plan_dir)
+                return blocks[0][0]
+                
+        return None
+
 
 # --- Spoke: Router (LLM State Machine) ---
 class RouterSpoke:
-    def __init__(self, plan_dir, dry_run=False):
+    def __init__(self, plan_dir, dry_run=False, tdd_mode=False):
         self.plan_dir = plan_dir
         self.dry_run = dry_run
+        self.tdd_mode = tdd_mode
         
     async def decide_next_step(self, task_description, state_summary, last_action_result):
         if self.dry_run:
             print("[DRY-RUN] RouterSpoke simulating next step...")
             return "CodeBuilder"
             
-        system_instruction = """You are the Router Agent for the Wheel-and-Spoke Orchestrator.
+        if self.tdd_mode:
+            system_instruction = """You are the Router Agent for the Wheel-and-Spoke Orchestrator, operating in strict Test-Driven Development (TDD) mode.
+Your job is to orchestrate the "Red-Green-Refactor" loop:
+1. TestBuilder: Writes a FAILING unit test for the requirement. (Use this first!)
+2. TestRunner: Runs the tests to verify the test fails (Red). (Use this after TestBuilder or CodeBuilder).
+3. CodeBuilder: Writes just enough application code to pass the failing test (Green). (Use this when tests fail due to missing implementation).
+4. CodeReviewer: Reviews the final diff once TestRunner confirms all tests pass.
+5. Resolver: Fixes infrastructure/environment errors if TestRunner hits toolchain issues.
+6. Exit: If stuck in an infinite loop.
+
+You MUST respond with exactly one line containing the next spoke to invoke. For example:
+NEXT: TestBuilder
+NEXT: TestRunner
+NEXT: CodeBuilder
+NEXT: CodeReviewer
+NEXT: Resolver
+NEXT: Exit"""
+        else:
+            system_instruction = """You are the Router Agent for the Wheel-and-Spoke Orchestrator.
 Your job is to read the current state of a software engineering task and decide which specialized agent (Spoke) to invoke next.
 
 Available Spokes:
@@ -1543,8 +1620,11 @@ async def run_orchestrator(args):
 
     async def run_router_loop(task, state, state_file, plan_dir, repo, args,
                               code_builder, pr_builder, test_runner, resolver_spoke, test_builder, code_reviewer):
-        router_spoke = RouterSpoke(plan_dir, dry_run=args.dry_run)
-        state_summary = f"Task {task['number']} started. Code has not been written yet. Start by using CodeBuilder."
+        router_spoke = RouterSpoke(plan_dir, dry_run=args.dry_run, tdd_mode=getattr(args, 'tdd', False))
+        if getattr(args, 'tdd', False):
+            state_summary = f"Task {task['number']} started. Strict TDD mode is ON. You MUST start by using TestBuilder to write a failing test."
+        else:
+            state_summary = f"Task {task['number']} started. Code has not been written yet. Start by using CodeBuilder."
         last_action_result = "No actions taken yet."
     
         router_iterations = 0
@@ -1579,6 +1659,19 @@ async def run_orchestrator(args):
                 else:
                     state_summary = "CodeBuilder failed to write changes."
                     last_action_result = f"CodeBuilder error: {build_res.get('reason', 'Unknown')}"
+
+            elif decision == "TestBuilder":
+                if not getattr(args, 'tdd', False):
+                    last_action_result = "TestBuilder cannot be invoked unless --tdd mode is enabled."
+                    state_summary = "Invalid spoke invocation."
+                else:
+                    test_file = await test_builder.generate_tdd_test(task["description"], state["pr_branch"])
+                    if test_file:
+                        state_summary = "A failing unit test was written. You MUST use TestRunner next to verify that it actually fails (Red phase)."
+                        last_action_result = f"TestBuilder wrote {test_file}. We expect tests to FAIL now."
+                    else:
+                        state_summary = "TestBuilder failed to write a test."
+                        last_action_result = "TestBuilder encountered an error."
                 
             elif decision == "TestRunner":
                 test_result = test_runner.run_checks()
@@ -1649,7 +1742,10 @@ async def run_orchestrator(args):
                         last_action_result = "Failed to merge PR."
                         state_summary = "PR Merge failed."
                 else:
-                    state_summary = "Code review rejected. You MUST use CodeBuilder to address the feedback."
+                    if getattr(args, 'tdd', False):
+                        state_summary = "Code review rejected. The task is not fully complete. You MUST use TestBuilder to write the next failing test for the missing requirements."
+                    else:
+                        state_summary = "Code review rejected. You MUST use CodeBuilder to address the feedback."
                     state["pr_number"] = None
                     save_state(state, state_file)
                 
@@ -1931,6 +2027,7 @@ if __name__ == "__main__":
     parser.add_argument("--jules-handle", default="@jules", help="Jules bot handle")
     parser.add_argument("--dry-run", action="store_true", help="Run the orchestrator loop with mocked spoke responses for verification")
     parser.add_argument("--mode", choices=["deterministic", "router"], default="router", help="Execution mode (router uses LLM for state transitions)")
+    parser.add_argument("--tdd", action="store_true", help="Enable Test Driven Development mode (forces TestBuilder first)")
 
     args = parser.parse_args()
     asyncio.run(run_orchestrator(args))
