@@ -1573,16 +1573,9 @@ async def run_orchestrator(args):
                     if not args.dry_run:
                         run_cmd(["git", "add", "."], cwd=plan_dir)
                         run_cmd(["git", "commit", "--no-verify", "-m", f"feat: implement task {task['number']} via Router fallback"], cwd=plan_dir)
-                        run_cmd(["git", "push", "origin", state["pr_branch"], "--no-verify"], cwd=plan_dir)
                 
-                    if not state.get("pr_number"):
-                        pr_num = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], "Gemini API")
-                        if pr_num:
-                            state["pr_number"] = pr_num
-                            save_state(state, state_file)
-                
-                    state_summary = "Code was written and pushed to the branch. You should now use TestRunner to verify."
-                    last_action_result = "Code successfully built and pushed."
+                    state_summary = "Code was written and committed locally. You should now use TestRunner to verify."
+                    last_action_result = "Code successfully built and committed."
                 else:
                     state_summary = "CodeBuilder failed to write changes."
                     last_action_result = f"CodeBuilder error: {build_res.get('reason', 'Unknown')}"
@@ -1598,11 +1591,21 @@ async def run_orchestrator(args):
                 elif code_failures:
                     last_action_result = test_runner.format_failures(code_failures)
                     state_summary = "Tests failed due to code bugs. You MUST use CodeBuilder next to fix them."
-                    state["pr_number"] = None
+                    # No longer nullifying pr_number since PR is only created on success now
                     save_state(state, state_file)
                 else:
                     last_action_result = "All lint checks and unit tests passed successfully."
-                    state_summary = "Tests passed. You should now use CodeReviewer to review the PR diff."
+                    
+                    print("🎉 Tests passed locally! Pushing branch and creating PR...")
+                    if not args.dry_run:
+                        run_cmd(["git", "push", "origin", state["pr_branch"], "--no-verify", "-f"], cwd=plan_dir)
+                    if not state.get("pr_number"):
+                        pr_num = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], "Gemini API")
+                        if pr_num:
+                            state["pr_number"] = pr_num
+                            save_state(state, state_file)
+                    
+                    state_summary = "Tests passed and PR created. You should now use CodeReviewer to review the PR diff."
                 
             elif decision == "Resolver":
                 fixed = auto_remediate_environment(plan_dir, last_action_result)
