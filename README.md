@@ -23,7 +23,9 @@ It uses a **hub-and-spoke architecture** where a central orchestrator coordinate
 |---|---|
 | **Fully autonomous** | Writes code → opens PR → runs tests → reviews → merges. Zero human steps. |
 | **Any AI provider** | Google Gemini, OpenAI, Ollama (local/free), or any OpenAI-compatible endpoint |
+| **Strict TDD Mode** | Optional `--tdd` flag enforces the Red-Green-Refactor loop natively |
 | **Smart retry loops** | 5 retries per task; lint failures and review feedback auto-feed back into the code builder |
+| **Human-in-the-loop** | Add `[BLOCKED]` to a task title to safely pause the orchestrator for manual QA or UI work |
 | **Env vs. bug detection** | Distinguishes broken environment (missing `rollup`, bad `node_modules`) from real bugs; runs `npm install` automatically |
 | **Transient fault tolerance** | WebSocket drops, 503s, rate-limit errors are retried with exponential backoff |
 | **Resumable state** | JSON state file persisted after every action — crash and re-run to pick up exactly where you left off |
@@ -284,6 +286,8 @@ algorithm. Return 429 Too Many Requests with a Retry-After header.
 **Rules:**
 - Headers must follow the pattern `### Task N: Title` (N is an integer)
 - Tasks marked `[COMPLETED]` or `[SKIPPED]` in the header are skipped automatically
+- Tasks marked `[BLOCKED]` will safely halt the orchestrator so a human can intervene
+- Tasks marked `[IN PROGRESS]` will seamlessly resume execution from the local `state.json`
 - When a task finishes, the orchestrator appends `[COMPLETED]` to the header and commits the updated plan to GitHub
 - Task body is passed verbatim as context to every spoke agent — be descriptive
 
@@ -302,6 +306,7 @@ Optional:
   --merge-method METHOD    PR merge strategy: merge | squash | rebase (default: merge)
   --start-task N           Skip to task number N (useful for resuming mid-plan)
   --jules-handle HANDLE    Jules bot GitHub handle (default: @jules)
+  --tdd                    Enable strict Test-Driven Development mode (Red-Green-Refactor)
   --dry-run                Simulate the full pipeline without real API calls or git mutations
 
 Examples:
