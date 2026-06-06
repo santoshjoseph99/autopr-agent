@@ -1436,12 +1436,16 @@ def parse_plan_tasks(plan_path):
         task_body = search_content[start_idx:end_idx].strip()
         task_title = title.strip()
         is_completed = "[COMPLETED]" in task_title.upper()
+        is_blocked = "[BLOCKED]" in task_title.upper()
+        is_in_progress = "[IN PROGRESS]" in task_title.upper()
         
         tasks.append({
             "number": int(task_num),
             "title": task_title,
             "description": f"Task {task_num}: {task_title}\n\n{task_body}",
-            "completed": is_completed
+            "completed": is_completed,
+            "blocked": is_blocked,
+            "in_progress": is_in_progress
         })
     return tasks
 
@@ -1796,6 +1800,14 @@ async def run_orchestrator(args):
         print("\n" + "="*60)
         print(f"📋 WHEEL-SPOKE: PROCESSING TASK {task['number']}: {task['title']}")
         print("="*60)
+        
+        if task.get("blocked"):
+            print(f"🛑 Task {task['number']} is marked as [BLOCKED]. Halting orchestrator.")
+            print("Please resolve the blocker manually and remove the [BLOCKED] tag before continuing.")
+            sys.exit(0)
+            
+        if task.get("in_progress"):
+            print(f"⏳ Task {task['number']} is marked as [IN PROGRESS]. Resuming where we left off...")
 
         # 1. Branch setup
         if not state.get("pr_branch"):
