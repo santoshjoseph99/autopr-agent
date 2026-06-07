@@ -17,6 +17,17 @@ It uses a **hub-and-spoke architecture** where a central orchestrator coordinate
 
 ---
 
+## 💡 Why build this?
+
+While tools like GitHub Copilot or Cursor are great for human-in-the-loop pair programming, they struggle with autonomous, unattended execution over long periods. This project was built to solve specific scaling problems with AI coding:
+
+1. **Context Limits & Hallucinations**: LLMs have limited attention spans. If you ask one monolithic agent to write code, debug environment errors, write tests, and run git commands, it gets confused by its own previous instructions and begins to hallucinate. By routing work to specialized, narrow "spokes", each agent gets a pristine context window focused solely on its specific task.
+2. **Token Economics (TokenMax / TokenMin)**: Different tasks require different levels of intelligence. You don't need a frontier model to evaluate a linting error. This architecture lets you route heavy coding tasks to cloud models (Gemini 3.1 Pro, GPT-4o) and simple tasks (or testing/reviewing) to free, local Ollama models (like `gemma4:26b` or `qwen2.5-coder`) — saving budget and optimizing speed.
+3. **Deterministic Progress vs. Infinite Loops**: Pure agentic loops (where the LLM decides what to do next) frequently get stuck in infinite failure loops. By using a hard-wired, deterministic Python state machine (`BUILD → TEST → RESOLVE → REVIEW`), we guarantee forward progress while using the LLMs purely for execution.
+4. **Self-Healing Environments**: Most AI coders fail the moment `npm install` throws a peer dependency conflict. This project specifically separates environment errors from code bugs, routing them to a dedicated `ResolverSpoke` that can fix the build environment autonomously before resuming coding.
+
+---
+
 ## ✨ Key Features
 
 | Feature | Details |
