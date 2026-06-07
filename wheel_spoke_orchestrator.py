@@ -17,6 +17,69 @@ import urllib.request
 import urllib.error
 import webbrowser
 import asyncio
+import logging
+import datetime
+import builtins
+
+# --- Setup Logging ---
+def setup_logging():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(script_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    log = logging.getLogger("orchestrator")
+    log.setLevel(logging.DEBUG)
+    
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_formatter = logging.Formatter('%(message)s')
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fh = logging.FileHandler(os.path.join(log_dir, f"orchestrator_{timestamp}.log"))
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(file_formatter)
+    
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(console_formatter)
+    
+    log.addHandler(fh)
+    log.addHandler(ch)
+    return log
+
+logger = setup_logging()
+
+# Intercept prints so existing codebase automatically logs to both console (INFO) and file (DEBUG)
+_original_print = builtins.print
+def custom_print(*args, **kwargs):
+    if kwargs.get("file") == sys.stderr:
+        logger.error(" ".join(map(str, args)))
+    else:
+        logger.info(" ".join(map(str, args)))
+builtins.print = custom_print
+
+# --- Prompt Loader ---
+def load_prompt(filename, **kwargs):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    prompt_path = os.path.join(script_dir, "prompts", filename)
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    
+    system_instruction = ""
+    prompt_text = ""
+    
+    if "===SYSTEM===" in content and "===PROMPT===" in content:
+        parts = content.split("===PROMPT===")
+        system_instruction = parts[0].replace("===SYSTEM===", "").strip()
+        prompt_text = parts[1].strip()
+    else:
+        prompt_text = content.strip()
+
+    for k, v in kwargs.items():
+        placeholder = f"{{{{{k}}}}}"
+        system_instruction = system_instruction.replace(placeholder, str(v))
+        prompt_text = prompt_text.replace(placeholder, str(v))
+        
+    return system_instruction, prompt_text
 
 # --- Bootstrap API keys BEFORE importing the Antigravity SDK ---
 # The SDK reads GEMINI_API_KEY at session creation time, so it must be set
@@ -401,26 +464,40 @@ async def call_model_api(provider, model, prompt, system_instruction=None,
     Automatically retries transient network/API failures with exponential backoff.
     All spoke classes call this function — they don't need to know about AIProvider.
     """
+    logger.debug(f"call_model_api: provider={provider}, model={model}")
+    logger.debug(f"SYSTEM INSTRUCTION:\n{system_instruction}\n")
+    logger.debug(f"PROMPT:\n{prompt}\n")
+    
     last_error = None
     for attempt in range(max_retries):
         result, last_error = await _call_model_api_once(
             provider, model, prompt, system_instruction, temperature, cwd
         )
         if result is not None:
+            logger.debug(f"RESPONSE:\n{result}\n")
             return result
         err_lower = str(last_error).lower()
         is_transient = any(p in err_lower for p in _TRANSIENT_ERROR_PATTERNS)
         if not is_transient or attempt == max_retries - 1:
             break
         wait = 5 * (2 ** attempt)  # 5s → 10s → 20s
-        print(f"⚠️ Transient API error (attempt {attempt+1}/{max_retries}). Retrying in {wait}s...")
+        logger.warning(f"⚠️ Transient API error (attempt {attempt+1}/{max_retries}). Retrying in {wait}s...")
         await asyncio.sleep(wait)
-    print(f"❌ API call failed after {max_retries} attempts: {last_error}")
+        
+    # Log full trace to file, print short to console
+    logger.debug(f"❌ API call full traceback/error:\n{last_error}", exc_info=last_error)
+    # Condense error for console:
+    condensed_err = str(last_error).strip().split('\n')[-1]
+    # Remove ANSI escape codes if present
+    condensed_err = re.sub(r'\x1b\[[0-9;]*[mG]', '', condensed_err)
+    if len(condensed_err) > 120:
+        condensed_err = condensed_err[:117] + "..."
+    logger.error(f"❌ API call failed ({type(last_error).__name__}): {condensed_err}")
     
     if api_cfg and "fallback" in api_cfg:
         fb = api_cfg["fallback"]
         fb_model = fb.get("model", "gemini-2.5-flash")
-        print(f"🔄 Primary API ({model}) failed. Falling back to {fb_model}...")
+        logger.info(f"🔄 Primary API ({model}) failed. Falling back to {fb_model}...")
         return await call_model_api(
             provider=fb.get("provider", "google"),
             model=fb_model,
@@ -686,7 +763,7 @@ class ResolverSpoke:
         """Returns (is_valid, reason). Rejects scripts with placeholder paths."""
         for pat in self._PLACEHOLDER_PATTERNS:
             if pat in script:
-                return False, f"Script contains placeholder path: '{pat}'"
+                        return False, f"Script contains placeholder path: '{pat}'"
         # Must not be empty after stripping comments
         real_lines = [l for l in script.splitlines()
                       if l.strip() and not l.strip().startswith("#")]
@@ -703,37 +780,15 @@ class ResolverSpoke:
         provider = api_cfg.get("provider", "google")
         model = api_cfg.get("model", "gemini-2.5-flash")
 
-        system_instruction = f"""You are a build environment repair agent for a Node.js/TypeScript monorepo.
-
-CRITICAL RULES — you MUST follow all of them:
-1. The project is located at: {self.plan_dir}
-   ALL commands must run from this directory (it is already the working directory — do NOT use cd).
-2. NEVER use placeholder paths like /path/to/project, ~/projects, your-project, or similar.
-   Use only real, literal paths. The real project path is: {self.plan_dir}
-3. Output ONLY a single ```bash code block. No prose, no explanation, no markdown outside the block.
-4. Commands run as: bash script.sh from inside {self.plan_dir}
-5. Do NOT add: set -e, set -x, or any shell options — just the raw fix commands.
-6. If the error mentions a missing package version, update package.json to use a compatible version
-   before running npm install — do not just retry the same install.
-
-You repair broken Node.js build environments. Common fixes:
-- Missing/broken node_modules → npm install or npm ci
-- Broken native bindings (rollup, esbuild, etc.) → rm -rf node_modules && npm install
-- Wrong package version → sed to update package.json, then npm install
-- Missing dist/build artifacts → npm run build (only if a build script exists)
-- Peer dep conflicts → npm install --legacy-peer-deps"""
-
         feedback = ""
         for attempt in range(3):
-            prompt = f"""Fix this build/test environment error.
-
-PROJECT DIRECTORY: {self.plan_dir}
-(All commands already run from this directory. Do NOT use cd.)
-
-ERROR OUTPUT:
-{error_output}
-{feedback}
-Output ONLY a ```bash block with the fix commands. No prose."""
+            feedback_text = feedback if feedback else "None"
+            system_instruction, prompt = load_prompt(
+                "resolver.md",
+                plan_dir=self.plan_dir,
+                error_output=error_output,
+                feedback=feedback_text
+            )
 
             print(f"🤖 ResolverSpoke analyzing error (attempt {attempt+1}/3, model: {model})...")
             res = await call_model_api(
@@ -908,51 +963,19 @@ class CodeReviewerSpoke:
             else:
                 print("[DRY-RUN] CodeReviewer: Simulating Code Review APPROVED.")
                 return "APPROVED"
-        review_prompt = f"""You are a senior software engineer doing a blocking code review for an automated pipeline.
-Your review verdict directly controls whether a PR gets merged — be thorough.
-
-TASK THE PR IS SUPPOSED TO IMPLEMENT:
----
-{task_description}
----
-
-PR DIFF:
----
-{pr_diff}
----
-
-Evaluate the diff on these criteria:
-1. CORRECTNESS: Does it fully implement every requirement in the task? Missing logic = blocking.
-2. COMPLETENESS: Are there any TODOs, placeholder comments, or "// implement later" stubs? Blocking.
-3. REGRESSIONS: Does it remove or break existing functionality not mentioned in the task? Blocking.
-4. TYPE SAFETY: Are there any `any` types, unchecked casts, or missing null checks that could crash at runtime? Blocking.
-5. ERROR HANDLING: Are async operations and API calls wrapped with try/catch or .catch()? Blocking if missing.
-6. SECURITY: Any hardcoded secrets, API keys, or credentials committed? Blocking.
-
-Non-blocking (note but do not reject for):
-- Code style preferences
-- Minor naming issues
-- Missing comments (unless the task explicitly requires them)
-
-RESPOND WITH EXACTLY ONE OF:
-- The single word: APPROVED
-  (only if ALL blocking criteria pass)
-- A numbered list of BLOCKING issues that must be fixed before merge
-  (do NOT write APPROVED if there are any blocking issues)
-
-Do not mix APPROVED with feedback. Either approve or reject with specific issues.
-"""
+                
+        system_instruction, review_prompt = load_prompt(
+            "code_reviewer.md", 
+            task_description=task_description, 
+            pr_diff=pr_diff
+        )
+        
         print("🕵️ Invoking Code Reviewer...")
         res = await call_model_api(
             provider=self.config["provider"],
             model=self.config["model"],
             prompt=review_prompt,
-            system_instruction=(
-                "You are a strict automated code reviewer. "
-                "Reply with exactly APPROVED (one word, nothing else) if the diff fully satisfies the task. "
-                "Otherwise reply with a numbered list of specific blocking defects. "
-                "Never mix APPROVED with feedback. Never approve incomplete implementations."
-            ),
+            system_instruction=system_instruction,
             cwd=self.plan_dir
         )
         return res
@@ -1041,50 +1064,23 @@ class TestBuilderSpoke:
                     await asyncio.sleep(POLL_INTERVAL)
 
         # --- LLM API path (fallback or when model != jules) ---
-        fallback_cfg = self.config.get("fallback", {})
-        if self.config.get("model") == "jules":
-            api_model = fallback_cfg.get("model", "gemini-1.5-flash")
-            api_provider = fallback_cfg.get("provider", "google")
-        else:
-            api_model = self.config.get("model")
-            api_provider = self.config.get("provider", "google")
-        # Build full fallback-aware api_cfg from config
-        if self.config.get("model") == "jules":
-            api_cfg = fallback_cfg
+        if not self.config.get("model") or self.config.get("model") == "jules":
+            api_cfg = self.config.get("fallback", {})
         else:
             api_cfg = self.config
-        prompt = f"""Write comprehensive unit tests for this task. The codebase uses TypeScript.
 
-TASK:
-{task_description}
+        system_instruction, prompt = load_prompt(
+            "test_builder_llm.md",
+            task_description=task_description,
+            code_diff=code_diff
+        )
 
-IMPLEMENTATION DIFF (for context on what was changed):
-{code_diff}
-
-RULES:
-- Use the existing test framework in the project (check for vitest.config.ts, jest.config.ts, or similar).
-- Import from the actual source files using relative paths — do not mock the module under test itself.
-- Test the happy path AND the main error/edge cases.
-- Do NOT re-test things already covered by existing tests.
-- Use real assertions, not just expect(true).toBe(true).
-- Each test should have a clear description of what it verifies.
-
-OUTPUT FORMAT — respond with exactly:
-File: <relative-path-from-repo-root>/file.test.ts
-```ts
-// complete test file
-```
-"""
         print("🧪 Invoking Test Builder (LLM API)...")
         res = await call_model_api(
             provider=api_cfg.get("provider", "google"),
             model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=prompt,
-            system_instruction=(
-                "You are a test engineer writing automated tests for a TypeScript/Node.js project. "
-                "Output only the test file using the 'File: <path>' format. "
-                "Do not explain, do not ask questions, output only the File block."
-            ),
+            system_instruction=system_instruction,
             cwd=self.plan_dir,
             api_cfg=api_cfg
         )
@@ -1107,46 +1103,22 @@ File: <relative-path-from-repo-root>/file.test.ts
             return "mock_tdd.spec.ts"
 
         # Explicitly use LLM API for TDD mode
-        fallback_cfg = self.config.get("fallback", {})
         if self.config.get("model") == "jules":
-            api_model = fallback_cfg.get("model", "gemini-1.5-flash")
-            api_provider = fallback_cfg.get("provider", "google")
-        else:
-            api_model = self.config.get("model")
-            api_provider = self.config.get("provider", "google")
-            
-        prompt = f"""You are executing the RED phase of Test-Driven Development.
-Write ONE failing unit test for the requirement below. Do NOT write any implementation code.
-
-TASK:
-{task_description}
-
-RULES:
-- Use the existing test framework (check for vitest.config.ts or jest.config.ts).
-- Import the function/class under test from its source file using a relative path.
-- The test MUST fail right now because the implementation doesn't exist or is incomplete.
-- Write only ONE logical test block (describe + it). Keep it minimal — just enough to fail.
-- Use your read_file and search_codebase tools to find existing test files and the right import paths.
-- Do NOT implement the feature. Do NOT add passing tests.
-
-OUTPUT FORMAT:
-Update File: <relative-path-from-repo-root>/file.test.ts
-```ts
-// complete test file contents
-```
-"""
-        # Build full fallback-aware api_cfg
-        if self.config.get("model") == "jules":
-            api_cfg = fallback_cfg
+            api_cfg = self.config.get("fallback", {})
         else:
             api_cfg = self.config
+            
+        system_instruction, prompt = load_prompt(
+            "test_builder_tdd.md",
+            task_description=task_description
+        )
 
         print("🧪 Invoking Test Builder (TDD Mode)...")
         res = await call_model_api(
             provider=api_cfg.get("provider", "google"),
             model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=prompt,
-            system_instruction="CRITICAL: You are an autonomous agent. Use your `read_file` tool to inspect the codebase if needed. DO NOT ask the user for files. Output exactly one 'Update File: <path>' block containing the unit test.",
+            system_instruction=system_instruction,
             cwd=self.plan_dir,
             api_cfg=api_cfg
         )
@@ -1472,56 +1444,23 @@ class CodeBuilderSpoke:
         file_context = self._gather_context(task_description, revision_feedback)
         repo_map = self._generate_repo_map()
 
-        api_prompt = f"""You are an expert TypeScript/Node.js engineer implementing a task in this codebase.
-
-CRITICAL RULES:
-- You are a fully autonomous agent. There is NO human to talk to. DO NOT ask questions.
-- If you need a file's contents, use your read_file or search_codebase tool — never ask the user.
-- Output EVERY file that needs to be created or modified using EXACTLY the format below.
-- Include COMPLETE file contents — not diffs, not snippets, not "rest of file unchanged".
-- Use paths relative to the repository root.
-- Do NOT output any prose, explanation, or commentary outside of file blocks.
-
-TASK:
-{task_description}
-
-REVISION FEEDBACK (if present, these are blocking issues you MUST fix):
-{revision_feedback or 'None — this is the first attempt.'}
-
-REPO STRUCTURE (TypeScript/JS files):
-{repo_map}
-
-RELEVANT FILE CONTENTS:
-{file_context}
-
-OUTPUT FORMAT — use exactly this for every file, no exceptions:
-
-Update File: packages/nexus/src/some/path/file.ts
-```ts
-// complete file contents
-```
-
-Update File: packages/nexus/src/another/file.ts
-```ts
-// complete file contents
-```
-
-IMPORTANT:
-- Do NOT output "// ... rest of file" or "// unchanged" — write the full file every time.
-- Do NOT include files that don't need changes.
-- Prefer editing existing files over creating new ones unless a new file is clearly required.
-- If revision feedback references a specific line or function, make sure you fix exactly that.
-"""
+        api_prompt_template_vars = {
+            "task_description": task_description,
+            "revision_feedback": revision_feedback or 'None — this is the first attempt.',
+            "repo_map": repo_map,
+            "file_context": file_context
+        }
+        
+        system_instruction, api_prompt = load_prompt(
+            "code_builder.md",
+            **api_prompt_template_vars
+        )
+        
         res = await call_model_api(
             provider=api_cfg.get("provider", "google"),
             model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=api_prompt,
-            system_instruction=(
-                "You are an autonomous code-writing agent. "
-                "You MUST use your read_file and search_codebase tools to gather context — never ask the user. "
-                "Output changes using the 'Update File: <path>' format only. "
-                "Never truncate file contents. Never output explanations outside code blocks."
-            ),
+            system_instruction=system_instruction,
             cwd=self.plan_dir,
             api_cfg=api_cfg
         )
