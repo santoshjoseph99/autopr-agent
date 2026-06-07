@@ -395,7 +395,7 @@ _TRANSIENT_ERROR_PATTERNS = [
 ]
 
 async def call_model_api(provider, model, prompt, system_instruction=None,
-                         temperature=0.2, cwd=None, max_retries=3):
+                         temperature=0.2, cwd=None, max_retries=3, api_cfg=None):
     """Thin retry wrapper around AIProvider.create().complete().
 
     Automatically retries transient network/API failures with exponential backoff.
@@ -416,6 +416,22 @@ async def call_model_api(provider, model, prompt, system_instruction=None,
         print(f"⚠️ Transient API error (attempt {attempt+1}/{max_retries}). Retrying in {wait}s...")
         await asyncio.sleep(wait)
     print(f"❌ API call failed after {max_retries} attempts: {last_error}")
+    
+    if api_cfg and "fallback" in api_cfg:
+        fb = api_cfg["fallback"]
+        fb_model = fb.get("model", "gemini-2.5-flash")
+        print(f"🔄 Primary API ({model}) failed. Falling back to {fb_model}...")
+        return await call_model_api(
+            provider=fb.get("provider", "google"),
+            model=fb_model,
+            prompt=prompt,
+            system_instruction=system_instruction,
+            temperature=temperature,
+            cwd=cwd,
+            max_retries=max_retries,
+            api_cfg=fb
+        )
+        
     return None
 
 
@@ -651,6 +667,33 @@ class ResolverSpoke:
         self.dry_run = dry_run
         self.require_approval = self.config.get("require_approval", False)
 
+    # Commands that are safe to run without approval
+    _SAFE_COMMAND_PREFIXES = [
+        "npm install", "npm ci", "npm rebuild", "npm cache clean",
+        "rm -rf node_modules", "rm -rf dist", "rm -rf .next",
+        "git checkout", "git clean",
+        "pip install", "pip uninstall",
+    ]
+
+    # Placeholder patterns that indicate the model hallucinated a path
+    _PLACEHOLDER_PATTERNS = [
+        "/path/to/your/project", "/path/to/project", "your/project",
+        "/your/", "your-project", "<project>", "<path>", "$(dirname \"$0\")",
+        "/home/user/", "~/projects/", "example.com",
+    ]
+
+    def _validate_script(self, script: str) -> tuple[bool, str]:
+        """Returns (is_valid, reason). Rejects scripts with placeholder paths."""
+        for pat in self._PLACEHOLDER_PATTERNS:
+            if pat in script:
+                return False, f"Script contains placeholder path: '{pat}'"
+        # Must not be empty after stripping comments
+        real_lines = [l for l in script.splitlines()
+                      if l.strip() and not l.strip().startswith("#")]
+        if not real_lines:
+            return False, "Script contains no executable commands"
+        return True, ""
+
     async def resolve(self, error_output: str) -> bool:
         if self.dry_run:
             print("[DRY-RUN] ResolverSpoke: Simulating resolution.")
@@ -659,73 +702,103 @@ class ResolverSpoke:
         api_cfg = self.config
         provider = api_cfg.get("provider", "google")
         model = api_cfg.get("model", "gemini-2.5-flash")
-        
+
+        system_instruction = f"""You are a build environment repair agent for a Node.js/TypeScript monorepo.
+
+CRITICAL RULES — you MUST follow all of them:
+1. The project is located at: {self.plan_dir}
+   ALL commands must run from this directory (it is already the working directory — do NOT use cd).
+2. NEVER use placeholder paths like /path/to/project, ~/projects, your-project, or similar.
+   Use only real, literal paths. The real project path is: {self.plan_dir}
+3. Output ONLY a single ```bash code block. No prose, no explanation, no markdown outside the block.
+4. Commands run as: bash script.sh from inside {self.plan_dir}
+5. Do NOT add: set -e, set -x, or any shell options — just the raw fix commands.
+6. If the error mentions a missing package version, update package.json to use a compatible version
+   before running npm install — do not just retry the same install.
+
+You repair broken Node.js build environments. Common fixes:
+- Missing/broken node_modules → npm install or npm ci
+- Broken native bindings (rollup, esbuild, etc.) → rm -rf node_modules && npm install
+- Wrong package version → sed to update package.json, then npm install
+- Missing dist/build artifacts → npm run build (only if a build script exists)
+- Peer dep conflicts → npm install --legacy-peer-deps"""
+
         feedback = ""
-        for attempt in range(2):
-            prompt = f"""An infrastructure or environment error occurred while running tests/lint. 
-Diagnose the error and provide the exact bash commands to fix it.
+        for attempt in range(3):
+            prompt = f"""Fix this build/test environment error.
+
+PROJECT DIRECTORY: {self.plan_dir}
+(All commands already run from this directory. Do NOT use cd.)
 
 ERROR OUTPUT:
 {error_output}
 {feedback}
-Output ONLY a single ```bash block containing the necessary commands. Do not write anything else."""
-            
-            print(f"🤖 ResolverSpoke analyzing environment error (attempt {attempt+1}/2, using {model})...")
+Output ONLY a ```bash block with the fix commands. No prose."""
+
+            print(f"🤖 ResolverSpoke analyzing error (attempt {attempt+1}/3, model: {model})...")
             res = await call_model_api(
                 provider=provider,
                 model=model,
                 prompt=prompt,
-                system_instruction="You are a DevOps troubleshooting agent. Output only bash commands inside a ```bash block.",
-                cwd=self.plan_dir
+                system_instruction=system_instruction,
+                cwd=self.plan_dir,
+                api_cfg=api_cfg
             )
-            
-            if not res and "fallback" in api_cfg:
-                fb = api_cfg["fallback"]
-                print(f"🔄 Resolver API failed. Falling back to {fb.get('model')}...")
-                res = await call_model_api(
-                    provider=fb.get("provider", "google"),
-                    model=fb.get("model", "gemini-2.5-flash"),
-                    prompt=prompt,
-                    system_instruction="You are a DevOps troubleshooting agent. Output only bash commands inside a ```bash block.",
-                    cwd=self.plan_dir
-                )
-                
+
             if not res:
-                return False
-                
+                print("⚠️ ResolverSpoke got no response from model.")
+                break
+
             match = re.search(r'```[a-zA-Z]*\s*\n(.*?)```', res, re.DOTALL)
             if not match:
-                print("⚠️ ResolverSpoke returned no bash block.")
-                return False
-                
+                print("⚠️ ResolverSpoke returned no ```bash block. Retrying with stricter prompt...")
+                feedback = "\n\nIMPORTANT: Your previous response had NO ```bash code block. You MUST output ONLY a ```bash block and nothing else."
+                continue
+
             bash_script = match.group(1).strip()
-            if not bash_script:
-                return False
-                
-            print(f"\n--- RESOLVER AGENT PROPOSED FIX ---\n{bash_script}\n-----------------------------------\n")
-            
+
+            # Validate before executing
+            valid, reason = self._validate_script(bash_script)
+            if not valid:
+                print(f"⚠️ Resolver script rejected ({reason}). Retrying...")
+                feedback = (f"\n\nPREVIOUS RESPONSE REJECTED: {reason}\n"
+                            f"You output:\n```bash\n{bash_script}\n```\n"
+                            f"Fix: use the REAL project path ({self.plan_dir}), never placeholder paths.")
+                continue
+
+            print(f"\n--- RESOLVER PROPOSED FIX ---\n{bash_script}\n-----------------------------\n")
+
             if self.require_approval:
-                ans = input("❓ Do you approve running these commands? [Y/n] ").strip().lower()
+                ans = input("❓ Approve running these commands? [Y/n] ").strip().lower()
                 if ans == 'n':
-                    print("❌ Resolver fix rejected.")
+                    print("❌ Resolver fix rejected by user.")
                     return False
-                    
-            print("🚀 Executing Resolver commands...")
+
+            print("🚀 Executing Resolver fix...")
             script_path = os.path.join(self.plan_dir, ".resolver_fix.sh")
             with open(script_path, "w") as f:
                 f.write(bash_script)
-            
-            stdout, stderr, code = run_cmd(["bash", ".resolver_fix.sh"], cwd=self.plan_dir)
-            os.remove(script_path)
-            
+
+            stdout, stderr, code = run_cmd(["bash", ".resolver_fix.sh"], cwd=self.plan_dir, timeout=300)
+            try:
+                os.remove(script_path)
+            except Exception:
+                pass
+
             if code == 0:
-                print("✅ Resolver successfully executed the fix.")
+                print("✅ Resolver fix succeeded.")
                 return True
             else:
-                print(f"❌ Resolver fix failed with exit code {code}:\n{stderr}")
-                feedback = f"\n\nPREVIOUS FIX ATTEMPT FAILED:\nYou ran:\n```bash\n{bash_script}\n```\nIt failed with exit code {code} and this output:\n{stderr}\nPlease provide an updated bash script to fix this."
-                
+                combined = (stdout + "\n" + stderr).strip()
+                print(f"❌ Resolver fix failed (exit {code}):\n{combined[:1000]}")
+                feedback = (f"\n\nPREVIOUS FIX FAILED (exit code {code}):\n"
+                            f"Commands you ran:\n```bash\n{bash_script}\n```\n"
+                            f"Failure output:\n{combined[:2000]}\n\n"
+                            f"Diagnose why those commands failed and propose a different fix.")
+
+        print("❌ ResolverSpoke exhausted all attempts.")
         return False
+
 
 
 class TestRunnerSpoke:
@@ -835,31 +908,51 @@ class CodeReviewerSpoke:
             else:
                 print("[DRY-RUN] CodeReviewer: Simulating Code Review APPROVED.")
                 return "APPROVED"
-        review_prompt = f"""You are an expert software engineer and code reviewer.
-Review the code changes provided in the diff below.
-The changes are intended to address this task description:
+        review_prompt = f"""You are a senior software engineer doing a blocking code review for an automated pipeline.
+Your review verdict directly controls whether a PR gets merged — be thorough.
 
-TASK:
+TASK THE PR IS SUPPOSED TO IMPLEMENT:
 ---
 {task_description}
 ---
 
-DIFF:
+PR DIFF:
 ---
 {pr_diff}
 ---
 
-Verify correctness, clean styles, performance, security, and adherence to the task.
+Evaluate the diff on these criteria:
+1. CORRECTNESS: Does it fully implement every requirement in the task? Missing logic = blocking.
+2. COMPLETENESS: Are there any TODOs, placeholder comments, or "// implement later" stubs? Blocking.
+3. REGRESSIONS: Does it remove or break existing functionality not mentioned in the task? Blocking.
+4. TYPE SAFETY: Are there any `any` types, unchecked casts, or missing null checks that could crash at runtime? Blocking.
+5. ERROR HANDLING: Are async operations and API calls wrapped with try/catch or .catch()? Blocking if missing.
+6. SECURITY: Any hardcoded secrets, API keys, or credentials committed? Blocking.
 
-If the diff correctly and completely implements the task specifications and has no issues, reply with exactly the word "APPROVED" (case-insensitive).
-If there are issues, list them clearly as bullet points so they can be fed back into an automated coder agent to fix them. Be specific about what needs to be changed. Do not output "APPROVED" if there are any pending issues.
+Non-blocking (note but do not reject for):
+- Code style preferences
+- Minor naming issues
+- Missing comments (unless the task explicitly requires them)
+
+RESPOND WITH EXACTLY ONE OF:
+- The single word: APPROVED
+  (only if ALL blocking criteria pass)
+- A numbered list of BLOCKING issues that must be fixed before merge
+  (do NOT write APPROVED if there are any blocking issues)
+
+Do not mix APPROVED with feedback. Either approve or reject with specific issues.
 """
-        print("🕵️ Invoking Code Reviewer Agent...")
+        print("🕵️ Invoking Code Reviewer...")
         res = await call_model_api(
             provider=self.config["provider"],
             model=self.config["model"],
             prompt=review_prompt,
-            system_instruction="You are a strict code reviewer. Return APPROVED or point out precise bugs/improvements.",
+            system_instruction=(
+                "You are a strict automated code reviewer. "
+                "Reply with exactly APPROVED (one word, nothing else) if the diff fully satisfies the task. "
+                "Otherwise reply with a numbered list of specific blocking defects. "
+                "Never mix APPROVED with feedback. Never approve incomplete implementations."
+            ),
             cwd=self.plan_dir
         )
         return res
@@ -955,27 +1048,45 @@ class TestBuilderSpoke:
         else:
             api_model = self.config.get("model")
             api_provider = self.config.get("provider", "google")
-        prompt = f"""Given the following task description and the implementation diff, write comprehensive unit or integration tests.
+        # Build full fallback-aware api_cfg from config
+        if self.config.get("model") == "jules":
+            api_cfg = fallback_cfg
+        else:
+            api_cfg = self.config
+        prompt = f"""Write comprehensive unit tests for this task. The codebase uses TypeScript.
 
-TASK DESCRIPTION:
+TASK:
 {task_description}
 
-CODE CHANGES DIFF:
+IMPLEMENTATION DIFF (for context on what was changed):
 {code_diff}
 
-Generate the complete test file. Respond with the file path followed by a markdown code block:
-File: packages/<package>/tests/my-test.spec.ts
+RULES:
+- Use the existing test framework in the project (check for vitest.config.ts, jest.config.ts, or similar).
+- Import from the actual source files using relative paths — do not mock the module under test itself.
+- Test the happy path AND the main error/edge cases.
+- Do NOT re-test things already covered by existing tests.
+- Use real assertions, not just expect(true).toBe(true).
+- Each test should have a clear description of what it verifies.
+
+OUTPUT FORMAT — respond with exactly:
+File: <relative-path-from-repo-root>/file.test.ts
 ```ts
-// test code here
+// complete test file
 ```
 """
         print("🧪 Invoking Test Builder (LLM API)...")
         res = await call_model_api(
-            provider=api_provider,
-            model=api_model,
+            provider=api_cfg.get("provider", "google"),
+            model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=prompt,
-            system_instruction="You are a test engineer. Output complete test files matching task specifications.",
-            cwd=self.plan_dir
+            system_instruction=(
+                "You are a test engineer writing automated tests for a TypeScript/Node.js project. "
+                "Output only the test file using the 'File: <path>' format. "
+                "Do not explain, do not ask questions, output only the File block."
+            ),
+            cwd=self.plan_dir,
+            api_cfg=api_cfg
         )
         if res:
             match = re.search(r'File:\s*([^\n]+)\n+```[a-zA-Z]*\n([\s\S]*?)```', res)
@@ -1004,30 +1115,40 @@ File: packages/<package>/tests/my-test.spec.ts
             api_model = self.config.get("model")
             api_provider = self.config.get("provider", "google")
             
-        prompt = f"""You are executing the first step of Test-Driven Development (TDD).
-Your job is to write a FAILING unit test for the following task description.
-DO NOT write the implementation code yet! Only write the test.
+        prompt = f"""You are executing the RED phase of Test-Driven Development.
+Write ONE failing unit test for the requirement below. Do NOT write any implementation code.
 
-TASK DESCRIPTION:
+TASK:
 {task_description}
 
-You have tools to read the codebase if you need to find existing test files to append to, or to check the API signature of the function you are testing.
-Output your test changes using EXACTLY this format:
+RULES:
+- Use the existing test framework (check for vitest.config.ts or jest.config.ts).
+- Import the function/class under test from its source file using a relative path.
+- The test MUST fail right now because the implementation doesn't exist or is incomplete.
+- Write only ONE logical test block (describe + it). Keep it minimal — just enough to fail.
+- Use your read_file and search_codebase tools to find existing test files and the right import paths.
+- Do NOT implement the feature. Do NOT add passing tests.
 
-Update File: packages/nexus/tests/some.test.ts
+OUTPUT FORMAT:
+Update File: <relative-path-from-repo-root>/file.test.ts
 ```ts
-// complete test file contents here
+// complete test file contents
 ```
-
-Remember: Write just enough of a test to fail (or fail to compile). Do not write more than one logical test block at a time.
 """
+        # Build full fallback-aware api_cfg
+        if self.config.get("model") == "jules":
+            api_cfg = fallback_cfg
+        else:
+            api_cfg = self.config
+
         print("🧪 Invoking Test Builder (TDD Mode)...")
         res = await call_model_api(
-            provider=api_provider,
-            model=api_model,
+            provider=api_cfg.get("provider", "google"),
+            model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=prompt,
             system_instruction="CRITICAL: You are an autonomous agent. Use your `read_file` tool to inspect the codebase if needed. DO NOT ask the user for files. Output exactly one 'Update File: <path>' block containing the unit test.",
-            cwd=self.plan_dir
+            cwd=self.plan_dir,
+            api_cfg=api_cfg
         )
         if res:
             # Reusing the Update File parsing logic from CodeBuilderSpoke
@@ -1051,7 +1172,8 @@ Remember: Write just enough of a test to fail (or fail to compile). Do not write
 
 # --- Spoke: Router (LLM State Machine) ---
 class RouterSpoke:
-    def __init__(self, plan_dir, dry_run=False, tdd_mode=False):
+    def __init__(self, config, plan_dir, dry_run=False, tdd_mode=False):
+        self.config = config
         self.plan_dir = plan_dir
         self.dry_run = dry_run
         self.tdd_mode = tdd_mode
@@ -1107,13 +1229,24 @@ LAST ACTION RESULT:
 What is the next Spoke to invoke?"""
         
         print("🧠 RouterSpoke analyzing state to decide next step...")
-        # Hardcoding openai/gpt-4o-mini as per user approval for speed/cost.
+        
+        # Load router config from config.json, or default to gpt-4o-mini with local fallback
+        api_cfg = self.config.get("router", {
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "fallback": {
+                "provider": "ollama",
+                "model": "qwen2.5-coder:7b"
+            }
+        })
+        
         res = await call_model_api(
-            provider="openai",
-            model="gpt-4o-mini",
+            provider=api_cfg.get("provider", "openai"),
+            model=api_cfg.get("model", "gpt-4o-mini"),
             prompt=prompt,
             system_instruction=system_instruction,
-            cwd=self.plan_dir
+            cwd=self.plan_dir,
+            api_cfg=api_cfg
         )
         
         if res:
@@ -1339,58 +1472,59 @@ class CodeBuilderSpoke:
         file_context = self._gather_context(task_description, revision_feedback)
         repo_map = self._generate_repo_map()
 
-        api_prompt = f"""You are an expert software engineer implementing a task in a real TypeScript/Electron codebase.
+        api_prompt = f"""You are an expert TypeScript/Node.js engineer implementing a task in this codebase.
+
+CRITICAL RULES:
+- You are a fully autonomous agent. There is NO human to talk to. DO NOT ask questions.
+- If you need a file's contents, use your read_file or search_codebase tool — never ask the user.
+- Output EVERY file that needs to be created or modified using EXACTLY the format below.
+- Include COMPLETE file contents — not diffs, not snippets, not "rest of file unchanged".
+- Use paths relative to the repository root.
+- Do NOT output any prose, explanation, or commentary outside of file blocks.
 
 TASK:
 {task_description}
 
-REVISION FEEDBACK (address these if present):
-{revision_feedback or 'None'}
+REVISION FEEDBACK (if present, these are blocking issues you MUST fix):
+{revision_feedback or 'None — this is the first attempt.'}
 
-REPO MAP (Directory structure and files):
+REPO STRUCTURE (TypeScript/JS files):
 {repo_map}
 
-RELEVANT FILES FROM CODEBASE:
+RELEVANT FILE CONTENTS:
 {file_context}
 
-You MUST output your changes using EXACTLY this format for each file. No exceptions:
+OUTPUT FORMAT — use exactly this for every file, no exceptions:
 
 Update File: packages/nexus/src/some/path/file.ts
 ```ts
-// complete file contents here
+// complete file contents
 ```
 
 Update File: packages/nexus/src/another/file.ts
 ```ts
-// complete file contents here
+// complete file contents
 ```
 
-Rules:
-- Output EVERY file that needs to be created or modified.
-- Include the COMPLETE file contents, not just diffs or snippets.
-- If a file does not need changes, do NOT include it.
-- Use the relative path from the repository root.
-- If you are missing context for an error (e.g., missing variable definition), use your `read_file` or `search_codebase` tools to find the correct file before writing your code!
-- CRITICAL: DO NOT talk to the user. DO NOT ask the user for files. You are a script. Use your `read_file` JSON tool.
+IMPORTANT:
+- Do NOT output "// ... rest of file" or "// unchanged" — write the full file every time.
+- Do NOT include files that don't need changes.
+- Prefer editing existing files over creating new ones unless a new file is clearly required.
+- If revision feedback references a specific line or function, make sure you fix exactly that.
 """
         res = await call_model_api(
             provider=api_cfg.get("provider", "google"),
             model=api_cfg.get("model", "gemini-2.5-flash"),
             prompt=api_prompt,
-            system_instruction="CRITICAL: You are an autonomous agent interacting with a machine API. THERE IS NO HUMAN TO TALK TO. You CANNOT ask questions or ask for file contents. If you need a file, YOU MUST use your `read_file` tool natively via JSON! If you output text asking the user for a file, the system will instantly crash. When you have enough context, you MUST output the 'Update File:' format.",
-            cwd=self.plan_dir
+            system_instruction=(
+                "You are an autonomous code-writing agent. "
+                "You MUST use your read_file and search_codebase tools to gather context — never ask the user. "
+                "Output changes using the 'Update File: <path>' format only. "
+                "Never truncate file contents. Never output explanations outside code blocks."
+            ),
+            cwd=self.plan_dir,
+            api_cfg=api_cfg
         )
-
-        if not res and "fallback" in api_cfg:
-            fb = api_cfg["fallback"]
-            print(f"🔄 Primary API failed or rate limited. Falling back to {fb.get('model')}...")
-            res = await call_model_api(
-                provider=fb.get("provider", "google"),
-                model=fb.get("model", "gemini-2.5-flash"),
-                prompt=api_prompt,
-                system_instruction="You are a senior software engineer. You MUST respond with file changes using the 'Update File: <path>' format followed by a code block. Do not respond with only prose.",
-                cwd=self.plan_dir
-            )
 
         if res:
             matches = list(re.finditer(r'Update File:\s*([^\n]+)\n+```[a-zA-Z]*\n([\s\S]*?)```', res))
@@ -1622,146 +1756,168 @@ async def run_orchestrator(args):
     )
     code_builder = CodeBuilderSpoke(config["code_builder"], repo, args.plan, plan_dir, args.jules_handle, dry_run=args.dry_run)
 
-    async def run_router_loop(task, state, state_file, plan_dir, repo, args,
-                              code_builder, pr_builder, test_runner, resolver_spoke, test_builder, code_reviewer):
-        router_spoke = RouterSpoke(plan_dir, dry_run=args.dry_run, tdd_mode=getattr(args, 'tdd', False))
-        if getattr(args, 'tdd', False):
-            state_summary = f"Task {task['number']} started. Strict TDD mode is ON. You MUST start by using TestBuilder to write a failing test."
-        else:
-            state_summary = f"Task {task['number']} started. Code has not been written yet. Start by using CodeBuilder."
-        last_action_result = "No actions taken yet."
-    
-        router_iterations = 0
-        max_iterations = 20
-    
-        while router_iterations < max_iterations:
-            router_iterations += 1
-            print(f"\\n--- ROUTER ITERATION {router_iterations}/{max_iterations} ---")
-        
-            decision = await router_spoke.decide_next_step(task["description"], state_summary, last_action_result)
-        
-            if decision == "CodeBuilder":
-                feedback = None
-                if "failed" in last_action_result.lower() or "error" in last_action_result.lower() or "rejected" in last_action_result.lower():
-                    feedback = last_action_result
 
+    async def run_deterministic_loop(task, state, state_file, plan_dir, repo, args,
+                                     code_builder, pr_builder, test_runner, resolver_spoke, code_reviewer):
+        """
+        Deterministic state machine — no LLM decides what to do next.
+
+        Flow:
+          BUILD → TEST ─── pass ──→ REVIEW → merge ✅
+                    │
+                    ├── code errors → BUILD (with feedback, up to MAX_CODE_RETRIES)
+                    └── env errors  → RESOLVE → TEST
+                                          └── fail → skip/exit
+        """
+        MAX_CODE_RETRIES = 5
+        MAX_ENV_RETRIES  = 3
+
+        code_retries = 0
+        env_retries  = 0
+        feedback     = None
+        phase        = "BUILD"
+
+        while True:
+            # ── BUILD ──────────────────────────────────────────────────────────
+            if phase == "BUILD":
+                if code_retries >= MAX_CODE_RETRIES:
+                    print(f"\n❌ CodeBuilder failed {code_retries} times in a row. Giving up on task {task['number']}.")
+                    break
+
+                attempt_label = f" (retry {code_retries}/{MAX_CODE_RETRIES})" if code_retries else ""
+                print(f"\n🔨 [BUILD{attempt_label}] Writing code for task {task['number']}...")
                 build_res = await code_builder.implement_task(
                     task["description"],
                     revision_feedback=feedback,
                     pr_branch=state["pr_branch"],
                     pr_number=state.get("pr_number")
                 )
-            
-                if build_res.get("mode") == "fallback":
-                    print("💾 Committing API changes locally...")
-                    if not args.dry_run:
-                        run_cmd(["git", "add", "."], cwd=plan_dir)
-                        run_cmd(["git", "commit", "--no-verify", "-m", f"feat: implement task {task['number']} via Router fallback"], cwd=plan_dir)
-                
-                    state_summary = "Code was written and committed locally. You should now use TestRunner to verify."
-                    last_action_result = "Code successfully built and committed."
-                else:
-                    state_summary = "CodeBuilder failed to write changes."
-                    last_action_result = f"CodeBuilder error: {build_res.get('reason', 'Unknown')}"
 
-            elif decision == "TestBuilder":
-                if not getattr(args, 'tdd', False):
-                    last_action_result = "TestBuilder cannot be invoked unless --tdd mode is enabled."
-                    state_summary = "Invalid spoke invocation."
+                if build_res.get("mode") in ("fallback", "jules"):
+                    if build_res.get("mode") == "fallback":
+                        print("💾 Committing API changes locally...")
+                        if not args.dry_run:
+                            run_cmd(["git", "add", "."], cwd=plan_dir)
+                            run_cmd(["git", "commit", "--no-verify", "-m",
+                                     f"feat: implement task {task['number']}"], cwd=plan_dir)
+                    elif build_res.get("mode") == "jules":
+                        state["jules_session_id"] = build_res["session_id"]
+                        save_state(state, state_file)
+
+                    feedback = None
+                    code_retries = 0
+                    phase = "TEST"
                 else:
-                    test_file = await test_builder.generate_tdd_test(task["description"], state["pr_branch"])
-                    if test_file:
-                        state_summary = "A failing unit test was written. You MUST use TestRunner next to verify that it actually fails (Red phase)."
-                        last_action_result = f"TestBuilder wrote {test_file}. We expect tests to FAIL now."
-                    else:
-                        state_summary = "TestBuilder failed to write a test."
-                        last_action_result = "TestBuilder encountered an error."
-                
-            elif decision == "TestRunner":
-                test_result = test_runner.run_checks()
-                env_failures = test_result.get("env_failures", [])
+                    code_retries += 1
+                    reason = build_res.get("reason", "unknown")
+                    print(f"⚠️ CodeBuilder produced no changes: {reason}")
+                    if code_retries >= MAX_CODE_RETRIES:
+                        print(f"❌ CodeBuilder exhausted all retries. Giving up on task {task['number']}.")
+                        break
+                    # Try again with broader prompt next iteration
+                    feedback = f"Previous attempt produced no output. Reason: {reason}. Please try a different approach."
+                    # stay in BUILD
+
+            # ── TEST ───────────────────────────────────────────────────────────
+            elif phase == "TEST":
+                print(f"\n🧪 [TEST] Running lint + unit tests...")
+                test_result  = test_runner.run_checks()
+                env_failures  = test_result.get("env_failures", [])
                 code_failures = test_result.get("code_failures", [])
-            
+
                 if env_failures:
-                    last_action_result = test_runner.format_failures(env_failures)
-                    state_summary = "Tests failed due to an environment/toolchain error. You MUST use Resolver next."
+                    print("⚠️ Environment/toolchain error detected — routing to Resolver.")
+                    feedback = test_runner.format_failures(env_failures)
+                    phase = "RESOLVE"
+
                 elif code_failures:
-                    last_action_result = test_runner.format_failures(code_failures)
-                    state_summary = "Tests failed due to code bugs. You MUST use CodeBuilder next to fix them."
-                    # No longer nullifying pr_number since PR is only created on success now
+                    code_retries += 1
+                    feedback = test_runner.format_failures(code_failures)
+                    print(f"❌ Tests failed (code bug). Sending feedback to CodeBuilder (retry {code_retries}/{MAX_CODE_RETRIES}).")
                     save_state(state, state_file)
+                    phase = "BUILD"
+
                 else:
-                    last_action_result = "All lint checks and unit tests passed successfully."
-                    
-                    print("🎉 Tests passed locally! Pushing branch and creating PR...")
+                    print("✅ All tests passed! Pushing branch and creating PR...")
                     if not args.dry_run:
                         run_cmd(["git", "push", "origin", state["pr_branch"], "--no-verify", "-f"], cwd=plan_dir)
                     if not state.get("pr_number"):
-                        pr_num = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], "Gemini API")
+                        pr_num = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], "Orchestrator")
                         if pr_num:
                             state["pr_number"] = pr_num
                             save_state(state, state_file)
-                    
-                    state_summary = "Tests passed and PR created. You should now use CodeReviewer to review the PR diff."
-                
-            elif decision == "Resolver":
-                fixed = auto_remediate_environment(plan_dir, last_action_result)
+                    phase = "REVIEW"
+
+            # ── RESOLVE ────────────────────────────────────────────────────────
+            elif phase == "RESOLVE":
+                env_retries += 1
+                if env_retries > MAX_ENV_RETRIES:
+                    print(f"❌ Resolver failed {MAX_ENV_RETRIES} times. Environment is broken. Giving up.")
+                    break
+
+                print(f"\n🔧 [RESOLVE] Fixing environment error (attempt {env_retries}/{MAX_ENV_RETRIES})...")
+                # Try auto-remediation first (zero LLM calls)
+                fixed = auto_remediate_environment(plan_dir, feedback)
                 if not fixed:
-                    fixed = await resolver_spoke.resolve(last_action_result)
-            
+                    fixed = await resolver_spoke.resolve(feedback)
+
                 if fixed:
-                    last_action_result = "Environment was successfully remediated."
-                    state_summary = "Environment fixed. You MUST use TestRunner next to re-run the tests."
+                    print("✅ Environment fixed. Re-running tests...")
+                    env_retries = 0
+                    phase = "TEST"
                 else:
-                    last_action_result = "Resolver failed to fix the environment."
-                    state_summary = "Environment is permanently broken. Cannot proceed."
-                
-            elif decision == "CodeReviewer":
+                    print(f"❌ Resolver could not fix the environment (attempt {env_retries}/{MAX_ENV_RETRIES}).")
+                    if env_retries >= MAX_ENV_RETRIES:
+                        print("❌ All resolver attempts exhausted. Giving up on task.")
+                        break
+                    # stay in RESOLVE, try again
+
+            # ── REVIEW ─────────────────────────────────────────────────────────
+            elif phase == "REVIEW":
+                print(f"\n🕵️ [REVIEW] Reviewing PR #{state.get('pr_number')}...")
                 if not state.get("pr_number"):
-                    last_action_result = "No PR exists to review."
-                    state_summary = "Cannot review because PR does not exist."
-                    continue
-                
+                    print("⚠️ No PR to review — pushing and creating PR first.")
+                    if not args.dry_run:
+                        run_cmd(["git", "push", "origin", state["pr_branch"], "--no-verify", "-f"], cwd=plan_dir)
+                    pr_num = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], "Orchestrator")
+                    if pr_num:
+                        state["pr_number"] = pr_num
+                        save_state(state, state_file)
+                    else:
+                        print("❌ Could not create PR. Giving up.")
+                        break
+
                 diff = pr_builder.get_pr_diff(state["pr_number"])
                 if not diff:
-                    last_action_result = "Failed to get PR diff."
-                    continue
-                
+                    print("❌ Could not fetch PR diff. Giving up.")
+                    break
+
                 review_res = await code_reviewer.review_diff(task["description"], diff)
-                last_action_result = review_res
-            
+
                 if "APPROVED" in review_res.upper() and "NOT APPROVED" not in review_res.upper() and "REJECTED" not in review_res.upper():
                     print(f"✅ Code review APPROVED for Task {task['number']}!")
                     if pr_builder.merge_pr(state["pr_number"], args.merge_method):
                         sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
                         send_notification("Task Completed", f"Task {task['number']} merged!")
-                    
                         state["completed_tasks"].append(task["number"])
                         state["current_task_idx"] += 1
-                        state["pr_branch"] = None
-                        state["pr_number"] = None
+                        state["pr_branch"]  = None
+                        state["pr_number"]  = None
                         save_state(state, state_file)
                         return True
                     else:
-                        last_action_result = "Failed to merge PR."
-                        state_summary = "PR Merge failed."
+                        print("❌ PR merge failed. Giving up.")
+                        break
                 else:
-                    if getattr(args, 'tdd', False):
-                        state_summary = "Code review rejected. The task is not fully complete. You MUST use TestBuilder to write the next failing test for the missing requirements."
-                    else:
-                        state_summary = "Code review rejected. You MUST use CodeBuilder to address the feedback."
+                    code_retries += 1
+                    feedback = review_res
+                    print(f"🔁 Review rejected. Sending feedback back to CodeBuilder (retry {code_retries}/{MAX_CODE_RETRIES}).")
                     state["pr_number"] = None
                     save_state(state, state_file)
-                
-            elif decision == "Exit":
-                print(f"\\n\u26a0\ufe0f Router elected to Exit for Task {task['number']}.")
-                break
-            
-            else:
-                print(f"⚠️ Unknown Router decision: {decision}")
-                break
+                    phase = "BUILD"
 
-        print(f"\\n\u26a0\ufe0f Router hit loop limit or elected to exit for Task {task['number']}.")
+        # ── Fallthrough: all retries exhausted ─────────────────────────────────
+        print(f"\n⚠️ Task {task['number']} could not be completed automatically.")
         print("Select recovery action:")
         print("  [A] Approve and merge PR manually")
         print("  [S] Skip this task and continue to next")
@@ -1777,7 +1933,7 @@ async def run_orchestrator(args):
                 state["pr_number"] = None
                 save_state(state, state_file)
             else:
-                print("\u274c Failed to resolve PR manually. Exiting.")
+                print("❌ Failed to resolve PR manually. Exiting.")
                 sys.exit(1)
         elif choice == "s":
             sync_and_tag_plan(args.plan, task["number"], tag="SKIPPED", dry_run=args.dry_run)
@@ -1788,7 +1944,7 @@ async def run_orchestrator(args):
             save_state(state, state_file)
         else:
             sys.exit(1)
-    
+
         return False
 
     while state["current_task_idx"] < len(tasks):
@@ -1800,230 +1956,24 @@ async def run_orchestrator(args):
         print("\n" + "="*60)
         print(f"📋 WHEEL-SPOKE: PROCESSING TASK {task['number']}: {task['title']}")
         print("="*60)
-        
+
         if task.get("blocked"):
             print(f"🛑 Task {task['number']} is marked as [BLOCKED]. Halting orchestrator.")
             print("Please resolve the blocker manually and remove the [BLOCKED] tag before continuing.")
             sys.exit(0)
-            
+
         if task.get("in_progress"):
             print(f"⏳ Task {task['number']} is marked as [IN PROGRESS]. Resuming where we left off...")
 
-        # 1. Branch setup
+        # Branch setup
         if not state.get("pr_branch"):
             state["pr_branch"] = f"jules-task-{task['number']}-{int(time.time())}"
             pr_builder.checkout_branch(state["pr_branch"], create=True)
             save_state(state, state_file)
 
-        if args.mode == "router":
-            await run_router_loop(task, state, state_file, plan_dir, repo, args,
-                                  code_builder, pr_builder, test_runner, resolver_spoke, test_builder, code_reviewer)
-            continue
-            
-        # 2. Outer loop: Retrying Code Builder + Verifications (Deterministic Mode)
-        retry_count = 0
-        feedback = None
-        while retry_count < 5:
-            # 2a. Code Builder
-            if not state.get("jules_session_id") and not state.get("pr_number"):
-                build_res = await code_builder.implement_task(
-                    task["description"],
-                    revision_feedback=feedback,
-                    pr_branch=state["pr_branch"],
-                    pr_number=state.get("pr_number")
-                )
-                
-                if build_res.get("mode") == "jules":
-                    state["jules_session_id"] = build_res["session_id"]
-                    save_state(state, state_file)
-                elif build_res.get("mode") == "fallback":
-                    print("💾 Committing API changes locally...")
-                    if not args.dry_run:
-                        run_cmd(["git", "add", "."], cwd=plan_dir)
-                        run_cmd(["git", "commit", "--no-verify", "-m",
-                                 f"feat: implement task {task['number']} via API fallback"], cwd=plan_dir)
-                        run_cmd(["git", "push", "origin", state["pr_branch"], "--no-verify"], cwd=plan_dir)
-                    else:
-                        print("[DRY-RUN] Committing and pushing API fallback changes")
-                else:
-                    # Code builder produced no changes — count this as a retry, not a hard crash
-                    retry_count += 1
-                    reason = build_res.get('reason', 'unknown')
-                    print(f"\u26a0\ufe0f Code builder produced no changes: {reason} "
-                          f"(retry {retry_count}/5 — will try again with broader context)")
-                    if retry_count >= 5:
-                        break  # fall through to skip logic below
-                    await asyncio.sleep(3)
-                    continue
-
-            # 2b. Pull and apply patch (if Jules mode was used)
-            if state.get("jules_session_id"):
-                session_id = state["jules_session_id"]
-                print(f"⏳ Resuming monitoring of Jules Session {session_id}...")
-                status = await code_builder.monitor_jules_session(session_id)
-                if status != "SUCCESS":
-                    print(f"❌ Jules session failed during resumed monitoring ({status}). Falling back to Code Builder agent fallback...")
-                    state["jules_session_id"] = None
-                    save_state(state, state_file)
-                    continue
-                
-                commit_msg = f"feat: implement task {task['number']} changes from jules session {session_id}"
-                success = pr_builder.apply_patch_and_push(session_id, state["pr_branch"], commit_msg)
-                state["jules_session_id"] = None
-                save_state(state, state_file)
-                if not success:
-                    print("❌ Failed to apply patch.")
-                    sys.exit(1)
-
-            # 2c. Create PR if missing
-            if not state.get("pr_number"):
-                session_link = f"https://jules.google.com/task/{state.get('jules_session_id', 'unknown')}" if state.get("jules_session_id") else "Gemini API"
-                pr_number = pr_builder.create_pr(task["number"], task["title"], state["pr_branch"], session_link)
-                if pr_number:
-                    state["pr_number"] = pr_number
-                    save_state(state, state_file)
-                else:
-                    print("❌ Failed to create PR.")
-                    sys.exit(1)
-
-            # 2c.5. Generate tests via Test Builder (Jules or LLM) — runs once per task
-            if not state.get("tests_generated"):
-                print("\n🔬 Invoking Test Builder spoke...")
-                pr_diff_for_tests = pr_builder.get_pr_diff(state["pr_number"])
-                if pr_diff_for_tests:
-                    test_result = await test_builder.generate_tests(
-                        task["description"], pr_diff_for_tests, state["pr_branch"]
-                    )
-                    # Mark as generated/attempted so we don't endlessly retry if the API is down
-                    state["tests_generated"] = True
-                    save_state(state, state_file)
-                else:
-                    print("⚠️ Could not fetch PR diff for test generation. Skipping.")
-                    state["tests_generated"] = True
-                    save_state(state, state_file)
-
-            # 2d. Run local tests / lint
-            test_result = test_runner.run_checks()
-            env_failures  = test_result.get("env_failures", [])
-            code_failures = test_result.get("code_failures", [])
-
-            # --- Environment issues: auto-remediate, don't send to code builder ---
-            if env_failures:
-                all_err_text = test_runner.format_failures(env_failures)
-                print(f"\\n🔧 Environment issue detected — attempting auto-remediation...")
-                
-                if state.get("env_remediations", 0) >= 2:
-                    print("⚠️ Max environment remediations (2) reached. Treating as code failure.")
-                    fixed = False
-                else:
-                    fixed = auto_remediate_environment(plan_dir, all_err_text)
-                    if not fixed:
-                        fixed = await resolver_spoke.resolve(all_err_text)
-                    
-                if fixed:
-                    state["env_remediations"] = state.get("env_remediations", 0) + 1
-                    print("✅ Remediation applied. Re-running tests (code builder NOT invoked).")
-                    # Don't reset pr_number or tests_generated — just retry the test step
-                    save_state(state, state_file)
-                    continue  # loop back — code builder skipped (pr_number still set)
-                else:
-                    print("⚠️ Could not auto-remediate. Treating as code failure for retry.")
-                    code_failures.extend(env_failures)  # fall through to normal retry
-
-            if code_failures:
-                retry_count += 1
-                feedback = test_runner.format_failures(code_failures)
-                print(f"\n\u26a0\ufe0f Verification failed (Retry {retry_count}/5):\n{feedback}")
-                state["pr_number"] = None  # force new commits
-                save_state(state, state_file)
-                continue
-            
-            # 2e. Run Code Reviewer
-            diff = pr_builder.get_pr_diff(state["pr_number"])
-            if not diff:
-                print("❌ Failed to get PR diff.")
-                sys.exit(1)
-
-            review_res = await code_reviewer.review_diff(task["description"], diff)
-            if not review_res:
-                print("❌ Code Reviewer failed to return a response.")
-                sys.exit(1)
-            print(f"\n--- CODE REVIEW OUTPUT ---\n{review_res}\n--------------------------\n")
-
-            if "APPROVED" in review_res.upper() and "NOT APPROVED" not in review_res.upper() and "REJECTED" not in review_res.upper():
-                print(f"✅ Code review APPROVED for Task {task['number']}!")
-                # Merge PR automatically
-                if pr_builder.merge_pr(state["pr_number"], args.merge_method):
-                    sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
-                    send_notification("Task Completed", f"Task {task['number']} merged!")
-                    
-                    state["completed_tasks"].append(task["number"])
-                    state["current_task_idx"] += 1
-                    state["pr_branch"] = None
-                    state["pr_number"] = None
-                    state["loop_count"] = 0
-                    state["env_remediations"] = 0
-                    state["tests_generated"] = False
-                    save_state(state, state_file)
-                    break
-                else:
-                    print("❌ Failed to merge PR.")
-                    sys.exit(1)
-            else:
-                retry_count += 1
-                feedback = review_res
-                print(f"❌ Review rejected (Retry {retry_count}/5). Requesting revision from builder...")
-                # Comment on the PR
-                if not args.dry_run:
-                    comment_body = f"@jules please address code review comments:\n\n{review_res}"
-                    run_cmd(["gh", "pr", "comment", str(state["pr_number"]), "--repo", repo, "--body", comment_body], cwd=plan_dir)
-                else:
-                    print(f"[DRY-RUN] Commenting code reviewer feedback on PR #{state['pr_number']}: {review_res[:50]}...")
-                
-                # Reset pr_number to force building next revision
-                state["pr_number"] = None
-                save_state(state, state_file)
-                continue
-
-        if retry_count >= 5:
-            send_notification("Retry Limit Exceeded", f"Task {task['number']} hit maximum fix loops (5/5).")
-            print(f"\n\u26a0\ufe0f Retry limit reached for Task {task['number']}.")
-            print("Select recovery action:")
-            print("  [A] Approve and merge PR manually")
-            print("  [S] Skip this task and continue to next")
-            print("  [E] Exit orchestrator")
-            choice = input("Choice: ").strip().lower()
-            if choice == "a":
-                print("🔀 Merging PR...")
-                pr_number, _ = pr_builder.find_pr_for_task(task["number"])
-                if pr_number and pr_builder.merge_pr(pr_number, args.merge_method):
-                    sync_and_tag_plan(args.plan, task["number"], dry_run=args.dry_run)
-                    state["completed_tasks"].append(task["number"])
-                    state["current_task_idx"] += 1
-                    state["pr_branch"] = None
-                    state["pr_number"] = None
-                    state["loop_count"] = 0
-                    state["env_remediations"] = 0
-                    state["tests_generated"] = False
-                    save_state(state, state_file)
-                else:
-                    print("\u274c Failed to resolve PR manually. Exiting.")
-                    sys.exit(1)
-            elif choice == "s":
-                print(f"\u23ed\ufe0f Skipping Task {task['number']} and marking as [SKIPPED] in plan...")
-                sync_and_tag_plan(args.plan, task["number"], tag="SKIPPED", dry_run=args.dry_run)
-                send_notification("Task Skipped", f"Task {task['number']} skipped after 5 failed retries.")
-                state["completed_tasks"].append(task["number"])
-                state["current_task_idx"] += 1
-                state["pr_branch"] = None
-                state["pr_number"] = None
-                state["loop_count"] = 0
-                state["env_remediations"] = 0
-                state["tests_generated"] = False
-                save_state(state, state_file)
-            else:
-                print("\u274c Exiting orchestrator.")
-                sys.exit(1)
+        await run_deterministic_loop(task, state, state_file, plan_dir, repo, args,
+                                     code_builder, pr_builder, test_runner, resolver_spoke, code_reviewer)
+        continue
 
     print("\n🏁 ALL TASKS COMPLETED SUCCESSFULLY! Wheel-Spoke Orchestrator finished.")
     send_notification("Orchestrator Finished", "All tasks in the plan are completed!")
@@ -2037,9 +1987,8 @@ if __name__ == "__main__":
     parser.add_argument("--merge-method", choices=["merge", "squash", "rebase"], default="merge", help="PR merge method")
     parser.add_argument("--start-task", type=int, help="Task number to start/resume from")
     parser.add_argument("--jules-handle", default="@jules", help="Jules bot handle")
-    parser.add_argument("--dry-run", action="store_true", help="Run the orchestrator loop with mocked spoke responses for verification")
-    parser.add_argument("--mode", choices=["deterministic", "router"], default="router", help="Execution mode (router uses LLM for state transitions)")
-    parser.add_argument("--tdd", action="store_true", help="Enable Test Driven Development mode (forces TestBuilder first)")
+    parser.add_argument("--dry-run", action="store_true", help="Run with mocked spoke responses for verification")
 
     args = parser.parse_args()
     asyncio.run(run_orchestrator(args))
+

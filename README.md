@@ -21,17 +21,16 @@ It uses a **hub-and-spoke architecture** where a central orchestrator coordinate
 
 | Feature | Details |
 |---|---|
-| **Fully autonomous** | Writes code → opens PR → runs tests → reviews → merges. Zero human steps. |
+| **Fully autonomous** | Writes code → runs tests → reviews → merges. Zero human steps. |
 | **Any AI provider** | Google Gemini, OpenAI, Ollama (local/free), or any OpenAI-compatible endpoint |
-| **Strict TDD Mode** | Optional `--tdd` flag enforces the Red-Green-Refactor loop natively |
-| **Smart retry loops** | 5 retries per task; lint failures and review feedback auto-feed back into the code builder |
-| **Human-in-the-loop** | Add `[BLOCKED]` to a task title to safely pause the orchestrator for manual QA or UI work |
-| **Env vs. bug detection** | Distinguishes broken environment (missing `rollup`, bad `node_modules`) from real bugs; runs `npm install` automatically |
+| **Recursive fallback chain** | Primary → OpenAI → Ollama. Never stops because one API is down. |
+| **Deterministic state machine** | No LLM decides what to do next. Flow is hard-wired: BUILD → TEST → RESOLVE/BUILD → REVIEW → merge |
+| **Smart env vs. bug detection** | Broken environment (missing `rollup`, bad `node_modules`) triggers Resolver, not CodeBuilder |
 | **Transient fault tolerance** | WebSocket drops, 503s, rate-limit errors are retried with exponential backoff |
 | **Resumable state** | JSON state file persisted after every action — crash and re-run to pick up exactly where you left off |
 | **Skip-on-failure** | After 5 retries, interactively `[S]kip` a task and continue to the next |
-| **Parallel execution** | Run two orchestrators in separate terminals targeting different repos simultaneously |
-| **Jules integration** | Optionally delegates test generation to Google Jules AI (with LLM fallback) |
+| **Human-in-the-loop** | Add `[BLOCKED]` to a task title to safely pause the orchestrator for manual QA or UI work |
+| **Jules integration** | Optionally delegates code or test generation to Google Jules AI (with LLM fallback) |
 
 ---
 
@@ -77,31 +76,34 @@ It uses a **hub-and-spoke architecture** where a central orchestrator coordinate
   └──────────────────┘
 ```
 
-### The Task Loop
+### The Task Loop (Deterministic State Machine)
 
-For each task in your plan, the orchestrator runs this loop:
+No LLM decides what happens next. The orchestrator follows a hard-wired state machine for every task:
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                         TASK LOOP                            │
-│                                                              │
-│  1. Code Builder  ──► writes code changes                    │
-│         │                                                    │
-│  2. Test Builder  ──► generates unit tests                   │
-│         │                                                    │
-│  3. PR Builder    ──► branch → commit → push → open PR       │
-│         │                                                    │
-│  4. Test Runner   ──► npm run lint && npm test               │
-│         │                                                    │
-│         ├── FAIL ──► feedback → Code Builder (retry)         │
-│         │                                                    │
-│  5. Code Reviewer ──► reviews diff vs. task spec             │
-│         │                                                    │
-│         ├── FEEDBACK ──► Code Builder (retry, max 5)         │
-│         │                                                    │
-│         └── APPROVED ──► PR Builder merges → mark COMPLETED  │
-└──────────────────────────────────────────────────────────────┘
+  BUILD ──────────────────────────────────────────────────────────────┐
+    │                                                                  │
+    │  CodeBuilder writes code changes                                 │
+    ▼                                                                  │
+  TEST                                                                 │
+    │  npm run lint && npm test                                        │
+    │                                                                  │
+    ├── env error ──► RESOLVE ──────────────────────────────────────► TEST
+    │                   │  auto-remediate (npm install, clean build)   │
+    │                   │  or LLM Resolver if unknown error            │
+    │                   └── fail 3x ──► [A]pprove / [S]kip / [E]xit   │
+    │                                                                  │
+    ├── code error ──► BUILD (with error feedback, max 5 retries) ────┘
+    │
+    └── pass ──► REVIEW
+                   │  CodeReviewer checks diff vs. task spec
+                   │
+                   ├── feedback ──► BUILD (with review feedback)
+                   │
+                   └── APPROVED ──► merge PR → mark [COMPLETED] ✅
 ```
+
+**Why deterministic?** An LLM deciding "what should I do next?" is unreliable, wastes tokens, and can loop forever. Hard-wiring the transitions means the orchestrator is always predictable and never spins.
 
 ---
 
@@ -170,7 +172,15 @@ the same public API. Do not change any tests.
 python3 wheel_spoke_orchestrator.py --plan /path/to/PLAN.md
 ```
 
-That's it. The orchestrator will now autonomously execute every task, creating branches, PRs, running tests, reviewing code, and merging — printing progress to your terminal as it goes.
+That's it. The orchestrator runs every task through the BUILD → TEST → RESOLVE → REVIEW state machine, creating branches, running tests, reviewing code, and merging — printing progress to your terminal as it goes.
+
+**To run overnight (unattended):**
+```bash
+nohup python3 wheel_spoke_orchestrator.py --plan /path/to/PLAN.md > /tmp/swarm.log 2>&1 &
+echo "PID: $!"
+# Check progress tomorrow:
+tail -f /tmp/swarm.log
+```
 
 ---
 
@@ -306,7 +316,6 @@ Optional:
   --merge-method METHOD    PR merge strategy: merge | squash | rebase (default: merge)
   --start-task N           Skip to task number N (useful for resuming mid-plan)
   --jules-handle HANDLE    Jules bot GitHub handle (default: @jules)
-  --tdd                    Enable strict Test-Driven Development mode (Red-Green-Refactor)
   --dry-run                Simulate the full pipeline without real API calls or git mutations
 
 Examples:
@@ -324,7 +333,11 @@ Examples:
 
   # Dry run — safe to test against your plan without side effects
   python3 wheel_spoke_orchestrator.py --plan ~/plans/SPRINT-24.md --dry-run
+
+  # Run overnight unattended
+  nohup python3 wheel_spoke_orchestrator.py --plan ~/plans/SPRINT-24.md > /tmp/swarm.log 2>&1 &
 ```
+
 
 ---
 
