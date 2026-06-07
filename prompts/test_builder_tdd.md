@@ -9,7 +9,7 @@ TASK:
 {{task_description}}
 
 RULES:
-- Use the existing test framework (check for vitest.config.ts or jest.config.ts).
+- Use the existing test framework for the {{language_context}} project. Detect it from the codebase.
 - Import the function/class under test from its source file using a relative path.
 - The test MUST fail right now because the implementation doesn't exist or is incomplete.
 - Write only ONE logical test block (describe + it). Keep it minimal — just enough to fail.

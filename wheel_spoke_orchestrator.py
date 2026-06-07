@@ -135,6 +135,51 @@ def load_config(config_path="config.json"):
             print(f"⚠️ Failed to parse {config_path}: {e}. Using defaults.")
     return DEFAULT_CONFIG
 
+def detect_project_context(plan_dir):
+    """Auto-detects language and commands, or reads .autopr.json from the project root."""
+    config_path = os.path.join(plan_dir, ".autopr.json")
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                return {
+                    "language": cfg.get("language", "Unknown"),
+                    "lint_commands": cfg.get("lint_commands", []),
+                    "test_commands": cfg.get("test_commands", [])
+                }
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to parse .autopr.json: {e}. Falling back to auto-detection.")
+
+    if os.path.exists(os.path.join(plan_dir, "package.json")):
+        return {
+            "language": "TypeScript/Node.js",
+            "lint_commands": [{"name": "npm lint", "cmd": ["npm", "run", "lint"]}],
+            "test_commands": [{"name": "npm test", "cmd": ["npm", "test"]}]
+        }
+    elif os.path.exists(os.path.join(plan_dir, "requirements.txt")) or os.path.exists(os.path.join(plan_dir, "pyproject.toml")):
+        return {
+            "language": "Python",
+            "lint_commands": [{"name": "flake8", "cmd": ["flake8", "."]}],
+            "test_commands": [{"name": "pytest", "cmd": ["pytest"]}]
+        }
+    elif os.path.exists(os.path.join(plan_dir, "go.mod")):
+        return {
+            "language": "Go",
+            "lint_commands": [{"name": "go vet", "cmd": ["go", "vet", "./..."]}],
+            "test_commands": [{"name": "go test", "cmd": ["go", "test", "./..."]}]
+        }
+    elif os.path.exists(os.path.join(plan_dir, "Cargo.toml")):
+        return {
+            "language": "Rust",
+            "lint_commands": [{"name": "cargo clippy", "cmd": ["cargo", "clippy"]}],
+            "test_commands": [{"name": "cargo test", "cmd": ["cargo", "test"]}]
+        }
+    return {
+        "language": "Generic",
+        "lint_commands": [],
+        "test_commands": []
+    }
+
 # --- Helper Functions ---
 def send_notification(title, message):
     """Sends a macOS desktop notification using osascript."""
@@ -785,6 +830,7 @@ class ResolverSpoke:
             feedback_text = feedback if feedback else "None"
             system_instruction, prompt = load_prompt(
                 "resolver.md",
+                language_context=self.ctx["language"],
                 plan_dir=self.plan_dir,
                 error_output=error_output,
                 feedback=feedback_text
@@ -854,81 +900,53 @@ class ResolverSpoke:
         print("❌ ResolverSpoke exhausted all attempts.")
         return False
 
-
-
 class TestRunnerSpoke:
-    def __init__(self, plan_dir, dry_run=False):
+    def __init__(self, plan_dir=None, dry_run=False):
         self.plan_dir = plan_dir
         self.dry_run = dry_run
-        self.call_count = 0
-
-    def _classify_failure(self, stdout: str, stderr: str) -> str:
-        """Returns 'env_error' if this is an infrastructure issue, 'code_error' otherwise."""
-        combined = (stdout + stderr).lower()
-        for pat in _ENV_ERROR_PATTERNS:
-            if pat in combined:
-                return "env_error"
-        return "code_error"
+        self.ctx = detect_project_context(plan_dir) if plan_dir else {"lint_commands": [], "test_commands": []}
 
     def run_checks(self):
-        """Runs npm test, lint, etc. Returns dict: {code_failures, env_failures}."""
+        """Runs linting and unit tests dynamically based on language context."""
+        logger.info("🧪 [TEST] Running local validation tests...")
+        
         if self.dry_run:
-            self.call_count += 1
-            print(f"[DRY-RUN] TestRunner: Running checks (attempt {self.call_count}).")
-            if self.call_count == 1:
-                print("[DRY-RUN] TestRunner: Simulating FAILURE on first attempt.")
-                return {"code_failures": [{"name": "Mock Lint", "command": "npm run lint",
-                                           "stdout": "", "stderr": "Mock: unused import"}],
-                        "env_failures": []}
-            print("[DRY-RUN] TestRunner: Simulating SUCCESS.")
+            logger.info("[DRY-RUN] TestRunner: Simulating Test Runner. Returning success.")
             return {"code_failures": [], "env_failures": []}
-
-        print("🧪 Running local validation tests (lint and unit tests)...")
-        verifications = []
-
-        pkg_path = os.path.join(self.plan_dir, "package.json")
-        has_nexus = os.path.exists(os.path.join(self.plan_dir, "packages/nexus"))
-
-        if os.path.exists(pkg_path):
-            try:
-                with open(pkg_path, "r", encoding="utf-8") as f:
-                    pkg = json.load(f)
-                scripts = pkg.get("scripts", {})
-                if has_nexus:
-                    verifications.append(("Lint Check", ["npm", "run", "lint", "--workspace=packages/nexus"]))
-                    verifications.append(("Unit Tests", ["npm", "test", "--workspace=packages/nexus"]))
-                else:
-                    if "lint" in scripts:
-                        verifications.append(("Lint Check", ["npm", "run", "lint"]))
-                    if "test" in scripts:
-                        if "no test specified" not in scripts["test"]:
-                            verifications.append(("Unit Tests", ["npm", "test"]))
-            except Exception as e:
-                print(f"\u26a0\ufe0f Failed to parse package.json: {e}")
-
-        if not verifications and not has_nexus:
-            print("\u2139\ufe0f No lint or test scripts found. Skipping local verification.")
-            return {"code_failures": [], "env_failures": []}
-
+            
         code_failures = []
         env_failures = []
+
+        verifications = []
+        for l in self.ctx.get("lint_commands", []):
+            verifications.append((l["name"], l["cmd"]))
+        for t in self.ctx.get("test_commands", []):
+            verifications.append((t["name"], t["cmd"]))
+
+        if not verifications:
+            logger.warning("⚠️ No test or lint commands configured/detected. Skipping verification.")
+            return {"code_failures": [], "env_failures": []}
+
         for name, cmd in verifications:
-            print(f"\u8dd1 Running {name}: {' '.join(cmd)}...")
+            logger.info(f"跑 Running {name}: {' '.join(cmd)}...")
             stdout, stderr, code = run_cmd(cmd, cwd=self.plan_dir)
             if code != 0:
-                failure = {"name": name, "command": " ".join(cmd),
-                           "stdout": stdout, "stderr": stderr}
-                kind = self._classify_failure(stdout, stderr)
-                if kind == "env_error":
-                    env_failures.append(failure)
-                    print(f"\u26a0\ufe0f {name} failed due to environment/toolchain issue (not a code bug).")
+                logger.error(f"❌ {name} failed.")
+                err = (stdout + "\n" + stderr).strip()
+                err_lower = err.lower()
+                
+                # Loose heuristic for environment vs code errors
+                if any(x in err_lower for x in ["command not found", "cannot find module", "no such file or directory", "missing dependency", "no module named", "not found"]):
+                    env_failures.append({"name": name, "command": " ".join(cmd), "error": err})
                 else:
-                    code_failures.append(failure)
-                    print(f"\u274c {name} failed.")
+                    code_failures.append({"name": name, "command": " ".join(cmd), "error": err})
             else:
-                print(f"\u2705 {name} passed.")
+                logger.info(f"✅ {name} passed.")
 
-        return {"code_failures": code_failures, "env_failures": env_failures}
+        return {
+            "code_failures": code_failures,
+            "env_failures": env_failures
+        }
 
     def format_failures(self, failures):
         body = "\u274c Local verification tests failed:\n\n"
@@ -952,6 +970,7 @@ class CodeReviewerSpoke:
         self.plan_dir = plan_dir
         self.dry_run = dry_run
         self.call_count = 0
+        self.ctx = detect_project_context(plan_dir) if plan_dir else {"language": "Generic"}
 
     async def review_diff(self, task_description, pr_diff):
         if self.dry_run:
@@ -1071,6 +1090,7 @@ class TestBuilderSpoke:
 
         system_instruction, prompt = load_prompt(
             "test_builder_llm.md",
+            language_context=self.ctx["language"],
             task_description=task_description,
             code_diff=code_diff
         )
@@ -1110,6 +1130,7 @@ class TestBuilderSpoke:
             
         system_instruction, prompt = load_prompt(
             "test_builder_tdd.md",
+            language_context=self.ctx["language"],
             task_description=task_description
         )
 
@@ -1241,6 +1262,7 @@ class CodeBuilderSpoke:
         self.plan_dir = plan_dir
         self.jules_handle = jules_handle
         self.dry_run = dry_run
+        self.ctx = detect_project_context(plan_dir) if plan_dir else {"language": "Generic"}
 
     def start_jules_session(self, prompt):
         """Kicks off a Jules session and extracts the session ID."""
@@ -1321,10 +1343,10 @@ class CodeBuilderSpoke:
     def _generate_repo_map(self, max_lines=1000):
         """Generates a tree-like map of all source files in the project."""
         stdout, _, code = run_cmd(
-            ["find", "src", "packages", "-type", "f", 
-             "-name", "*.ts", "-o", "-name", "*.tsx", 
+            ["find", ".", "-type", "f", 
              "-not", "-path", "*/node_modules/*", 
              "-not", "-path", "*/dist/*",
+             "-not", "-path", "*/build/*",
              "-not", "-path", "*/.git/*"],
             cwd=self.plan_dir
         )
@@ -1333,11 +1355,12 @@ class CodeBuilderSpoke:
         files = stdout.strip().split("\n")
         files.sort()
         if len(files) > max_lines:
-            # If too large, just show the directory structure of src and packages
+            # If too large, just show the directory structure
             stdout_dirs, _, _ = run_cmd(
-                ["find", "src", "packages", "-type", "d",
+                ["find", ".", "-type", "d",
                  "-not", "-path", "*/node_modules/*",
                  "-not", "-path", "*/dist/*",
+                 "-not", "-path", "*/build/*",
                  "-not", "-path", "*/.git/*"],
                 cwd=self.plan_dir
             )
@@ -1351,13 +1374,14 @@ class CodeBuilderSpoke:
 
         search_text = task_description + "\n" + str(revision_feedback or "")
         # 1. Find specific filenames with extensions mentioned in task
-        file_mentions = re.findall(r'[\w\-./]+\.(?:ts|tsx|js|jsx|py|json|md)', search_text)
+        file_mentions = re.findall(r'[\w\-./]+\.(?:ts|tsx|js|jsx|py|json|md|go|rs|java|cpp|c|h|hpp)', search_text)
         for fname in file_mentions[:max_files]:
             basename = os.path.basename(fname)
             stdout, _, code = run_cmd(
                 ["find", ".", "-name", basename,
                  "-not", "-path", "*/node_modules/*",
                  "-not", "-path", "*/.git/*",
+                 "-not", "-path", "*/build/*",
                  "-not", "-path", "*/dist/*"],
                 cwd=self.plan_dir
             )
@@ -1373,7 +1397,9 @@ class CodeBuilderSpoke:
             abs_dir = os.path.join(self.plan_dir, dir_path)
             if os.path.isdir(abs_dir):
                 stdout, _, code = run_cmd(
-                    ["find", abs_dir, "-name", "*.ts", "-o", "-name", "*.tsx"],
+                    ["find", abs_dir, "-type", "f", 
+                     "-not", "-path", "*/node_modules/*",
+                     "-not", "-path", "*/.git/*"],
                     cwd=self.plan_dir
                 )
                 if code == 0:
@@ -1394,16 +1420,17 @@ class CodeBuilderSpoke:
                     pass
 
         if not context:
-            # Last resort: list the top-level package dirs so Gemini knows the structure
+            # Last resort: list the top-level package dirs so LLM knows the structure
             stdout, _, _ = run_cmd(
-                ["find", ".", "-maxdepth", "4", "-name", "*.ts",
+                ["find", ".", "-maxdepth", "4", "-type", "f",
                  "-not", "-path", "*/node_modules/*",
                  "-not", "-path", "*/.git/*",
+                 "-not", "-path", "*/build/*",
                  "-not", "-path", "*/dist/*"],
                 cwd=self.plan_dir
             )
             file_list = "\n".join(stdout.strip().split("\n")[:40])
-            context = f"(no specific files matched — here are available TypeScript files)\n{file_list}"
+            context = f"(no specific files matched — here are available source files)\n{file_list}"
 
         return context
 
@@ -1445,6 +1472,7 @@ class CodeBuilderSpoke:
         repo_map = self._generate_repo_map()
 
         api_prompt_template_vars = {
+            "language_context": self.ctx["language"],
             "task_description": task_description,
             "revision_feedback": revision_feedback or 'None — this is the first attempt.',
             "repo_map": repo_map,
