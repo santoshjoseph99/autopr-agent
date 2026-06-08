@@ -953,7 +953,7 @@ class TestRunnerSpoke:
         for f in failures:
             body += f"### {f['name']} (`{f['command']}`)\n"
             body += "```\n"
-            output = (f['stdout'].strip() + "\n" + f['stderr'].strip()).strip()
+            output = f['error'].strip()
             lines = output.strip().split("\n")
             # Increase limit dramatically so we don't truncate the actual test failures
             if len(lines) > 300:
