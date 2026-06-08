@@ -788,6 +788,7 @@ class ResolverSpoke:
         self.plan_dir = plan_dir
         self.dry_run = dry_run
         self.require_approval = self.config.get("require_approval", False)
+        self.ctx = detect_project_context(plan_dir) if plan_dir else {"language": "Generic"}
 
     # Commands that are safe to run without approval
     _SAFE_COMMAND_PREFIXES = [
